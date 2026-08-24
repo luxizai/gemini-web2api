@@ -127,6 +127,20 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+        elif "# Netscape HTTP Cookie File" in content or content.startswith("#HttpOnly_"):
+            # Netscape cookies.txt (tab-separated: domain, flag, path, secure, expiry, name, value)
+            pairs = {}
+            for line in content.splitlines():
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 7:
+                    continue
+                pairs[parts[5]] = parts[6]
+            cookie_str = "; ".join(f"{k}={v}" for k, v in pairs.items())
+            sapisid = pairs.get("SAPISID", "")
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -161,11 +175,13 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 
 def fetch_latest_bl() -> Optional[str]:
-    """Fetch the latest gemini_bl from gemini.google.com page."""
+    """Fetch the latest gemini_bl (and xsrf token when cookies are set) from gemini.google.com page."""
     try:
-        req = urllib.request.Request(
-            "https://gemini.google.com/app",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        cookie_str, _ = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
         ctx = ssl.create_default_context()
         proxy = CONFIG.get("proxy")
         if proxy:
@@ -176,6 +192,9 @@ def fetch_latest_bl() -> Optional[str]:
         else:
             resp = urllib.request.urlopen(req, context=ctx, timeout=15)
         html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'"SNlM0e":"([^"]+)"', html)
+        if m:
+            CONFIG["xsrf_token"] = m.group(1)
         m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
         if m:
             return m.group(1)
@@ -185,11 +204,12 @@ def fetch_latest_bl() -> Optional[str]:
 
 
 def update_bl_if_needed() -> bool:
-    """Attempt to fetch and update gemini_bl. Returns True if updated."""
-    new_bl = fetch_latest_bl()
-    if new_bl and new_bl != CONFIG["gemini_bl"]:
-        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-        CONFIG["gemini_bl"] = new_bl
+    """Attempt to fetch and refresh gemini_bl + xsrf_token. Returns True if anything changed."""
+    old_bl = CONFIG["gemini_bl"]
+    old_xsrf = CONFIG.get("xsrf_token")
+    fetch_latest_bl()  # also refreshes xsrf_token when cookies are set
+    if CONFIG["gemini_bl"] != old_bl or CONFIG.get("xsrf_token") != old_xsrf:
+        log(f"BL/XSRF refreshed: bl {old_bl} -> {CONFIG['gemini_bl']}, xsrf {'-> new' if CONFIG.get('xsrf_token') != old_xsrf else 'unchanged'}")
         return True
     return False
 
@@ -246,37 +266,39 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[79] = model_id
 
     outer = [None, json.dumps(inner)]
-    params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
-    body = urllib.parse.urlencode(params).encode()
-    reqid = int(time.time()) % 1000000
-    prefix = account_prefix()
-    url = (
-        f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-    )
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": f"https://gemini.google.com{prefix}/app",
-        "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    if prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
 
-    cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
+    def build_request():
+        params = {"f.req": json.dumps(outer)}
+        if CONFIG.get("xsrf_token"):
+            params["at"] = CONFIG["xsrf_token"]
+        body = urllib.parse.urlencode(params).encode()
+        reqid = int(time.time()) % 1000000
+        prefix = account_prefix()
+        url = (
+            f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+            "assistant.lamda.BardFrontendService/StreamGenerate"
+            f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://gemini.google.com",
+            "Referer": f"https://gemini.google.com{prefix}/app",
+            "X-Same-Domain": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        cookie_str, sapisid = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            req = build_request()
             ctx = ssl.create_default_context()
             proxy = CONFIG.get("proxy")
             if proxy:
@@ -289,14 +311,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             return resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
-            if e.code == 405 and update_bl_if_needed():
-                reqid = int(time.time()) % 1000000
-                url = (
-                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-                    "assistant.lamda.BardFrontendService/StreamGenerate"
-                    f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-                )
-                log("Retrying with updated BL...")
+            if e.code in (400, 405) and update_bl_if_needed():
+                log("Retrying with refreshed BL/XSRF...")
                 last_err = e
                 continue
             last_err = e
@@ -337,31 +353,34 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[79] = model_id
 
     outer = [None, json.dumps(inner)]
-    params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
-    body = urllib.parse.urlencode(params)
-    reqid = int(time.time()) % 1000000
-    prefix = account_prefix()
-    url = (
-        f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
-    )
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": f"https://gemini.google.com{prefix}/app",
-        "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    if prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
+
+    def build_stream_request():
+        params = {"f.req": json.dumps(outer)}
+        if CONFIG.get("xsrf_token"):
+            params["at"] = CONFIG["xsrf_token"]
+        body = urllib.parse.urlencode(params)
+        reqid = int(time.time()) % 1000000
+        prefix = account_prefix()
+        url = (
+            f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+            "assistant.lamda.BardFrontendService/StreamGenerate"
+            f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://gemini.google.com",
+            "Referer": f"https://gemini.google.com{prefix}/app",
+            "X-Same-Domain": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        cookie_str, sapisid = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        return url, body, headers
 
     proxy = CONFIG.get("proxy")
 
@@ -377,6 +396,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         try:
+            url, body, headers = build_stream_request()
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
@@ -410,14 +430,14 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
         except Exception as e:
-            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
-                if update_bl_if_needed():
-                    log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
-                    text = extract_response_text(raw)
-                    if text:
-                        yield text
-                    return
+            status = getattr(getattr(e, "response", None), "status_code", 0)
+            if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
+                log("BL/XSRF refreshed, falling back to non-streaming for this request")
+                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+                text = extract_response_text(raw)
+                if text:
+                    yield text
+                return
             raise
 
 

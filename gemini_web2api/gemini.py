@@ -5,9 +5,11 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
+from typing import Optional
 
 try:
     import httpx
@@ -60,6 +62,20 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+        elif "# Netscape HTTP Cookie File" in content or content.startswith("#HttpOnly_"):
+            # Netscape cookies.txt (tab-separated: domain, flag, path, secure, expiry, name, value)
+            pairs = {}
+            for line in content.splitlines():
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 7:
+                    continue
+                pairs[parts[5]] = parts[6]
+            cookie_str = "; ".join(f"{k}={v}" for k, v in pairs.items())
+            sapisid = pairs.get("SAPISID", "")
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -69,6 +85,41 @@ def load_cookie() -> tuple:
     except Exception as e:
         log(f"Cookie load error: {e}")
         return _cookie_cache["str"], _cookie_cache["sapisid"]
+
+
+def refresh_bl_and_xsrf() -> bool:
+    """Fetch the app page with cookies; refresh gemini_bl and xsrf_token (SNlM0e).
+    Returns True if either value changed."""
+    old_bl = CONFIG["gemini_bl"]
+    old_xsrf = CONFIG.get("xsrf_token")
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        cookie_str, _ = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+        proxy = CONFIG.get("proxy")
+        ctx = _get_ssl_ctx()
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx))
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'"SNlM0e":"([^"]+)"', html)
+        if m:
+            CONFIG["xsrf_token"] = m.group(1)
+        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        if m:
+            CONFIG["gemini_bl"] = m.group(1)
+    except Exception as e:
+        log(f"BL/XSRF refresh failed: {e}")
+    changed = CONFIG["gemini_bl"] != old_bl or CONFIG.get("xsrf_token") != old_xsrf
+    if changed:
+        log(f"BL/XSRF refreshed: xsrf {'new' if CONFIG.get('xsrf_token') != old_xsrf else 'unchanged'}, bl {old_bl} -> {CONFIG['gemini_bl']}")
+    return changed
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -204,15 +255,15 @@ def extract_response_text(raw: str) -> str:
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
-    headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
+            body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+            url = _get_url()
+            headers = _build_headers()
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
                 opener = urllib.request.build_opener(
@@ -224,6 +275,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 405) and refresh_bl_and_xsrf():
+                log("Retrying with refreshed BL/XSRF...")
+                last_err = e
+                continue
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -240,15 +300,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers()
     client = _get_httpx_client()
 
     last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
+            body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+            url = _get_url()
+            headers = _build_headers()
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
@@ -273,6 +333,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", 0)
+            if status in (400, 405) and not emitted_raw_text and refresh_bl_and_xsrf():
+                log("Stream retrying with refreshed BL/XSRF...")
+                last_err = e
+                continue
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
