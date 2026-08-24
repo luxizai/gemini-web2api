@@ -25,7 +25,19 @@ Gemini Web2API 是一个部署在 Cloudflare Workers 上的无服务器代理服
 
 ## 🚀 快速部署
 
-### 第一步：登录 Cloudflare
+### 方式一：连接 Git 储存库（自动构建）
+
+1. 在 Cloudflare Dashboard → **Workers & Pages** → 创建 → 选择 **连接 Git 储存库**，选中本项目的 fork
+2. 构建设置保持默认即可：
+   - **Build command**：`npx wrangler deploy`（默认值，本仓库已内置 `wrangler.toml`，wrangler 会自动部署 `cloudflare/worker.js`）
+   - **Builds for non-production branches**：建议**关闭**（此 Worker 无预览页概念，非生产分支构建只会重复部署）
+   - **Protect with Cloudflare Access**：建议**关闭**（会给预览 URL 加登录墙；若你的 API 客户端（如 Hermes/机器人）要直接调用，任何 Access 保护都会挡掉请求）
+3. 若你在 Dashboard 先建立了 Worker 再连接 Git，请把 `wrangler.toml` 里的 `name` 改成与该 Worker 同名，避免部署出第二个 Worker
+4. 部署完成后，到 Worker → **设置 → 变量** 配置环境变量（`API_KEYS`、`COOKIE_STRING`、`SAPISID` 等，见下文），**每次修改代码推送后自动重新部署，变量不受影响**
+
+> 提示：此方式由 Cloudflare 托管构建，无需自己申请 API Token。若改用 Pages + `npx wrangler deploy` 的构建命令方式，则需自行配置 `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID` 环境变量。
+
+### 方式二：Dashboard 粘贴代码（最简单）
 
 1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com)
 2. 登录你的 Cloudflare 账号（没有账号可以免费注册）
