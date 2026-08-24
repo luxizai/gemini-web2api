@@ -64,7 +64,7 @@ https://你的worker.workers.dev/health
 ```json
 {
   "status": "ok",
-  "version": "1.5.0-cf-multifingerprint",
+  "version": "1.5.1-cf-strict-parsing",
   "platform": "Cloudflare Workers",
   "models": ["gemini-3.6-flash", "gemini-3.5-flash", "..."],
   "hasCookie": false,
@@ -287,6 +287,7 @@ SAPISID = "sapisid_1| sapisid_2| sapisid_3"
 
 | 版本 | 日期 | 更新内容 |
 |------|------|---------|
+| 1.5.1 | 2026-08-24 | 修复答非所问问题：只取主答案框架（携带对话/响应 ID）的第 0 号候选，忽略思考摘要/替代草稿/后续建议框架；答案多段文字正确 join；串流不再切片拼接无关文本，中途改写时冻结已发送内容；`_reqid` 改为进程内递增计数器，消除并发碰撞 |
 | 1.5.0 | 2026-07-31 | 新增多指纹轮换、多Cookie轮换、随机延迟机制 |
 | 1.4.0 | 2026-07-30 | 修复并发串扰、速率限制内存安全 |
 | 1.3.0 | 2026-07-29 | 修复 SSE 流式格式、NextChat 兼容性 |
