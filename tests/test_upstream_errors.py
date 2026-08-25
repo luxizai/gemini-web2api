@@ -92,5 +92,55 @@ class StreamErrorChunkTests(unittest.TestCase):
         self.assertIn("data: [DONE]", body)
 
 
+
+
+class NonStreamSuccessTests(unittest.TestCase):
+    """Mocked upstream success: raw response -> OpenAI completion shape."""
+
+    @classmethod
+    def setUpClass(cls):
+        from gemini_web2api.server import GeminiHandler, ThreadedServer
+        cls.server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.port = cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        from gemini_web2api.config import CONFIG
+        self.original_config = dict(CONFIG)
+        CONFIG["api_keys"] = []
+        CONFIG["log_requests"] = False
+
+    def tearDown(self):
+        from gemini_web2api.config import CONFIG
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_non_stream_success_shape(self):
+        from unittest import mock
+        # server.generate() returns already-extracted text; feed it the parsed expectation
+        with mock.patch("gemini_web2api.server.generate", return_value="Раз, два, три, четыре, пять."):
+            status, _, body = self._post({"model": "gemini-3.6-flash",
+                                          "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["choices"][0]["message"]["content"], "\u0420\u0430\u0437, \u0434\u0432\u0430, \u0442\u0440\u0438, \u0447\u0435\u0442\u044b\u0440\u0435, \u043f\u044f\u0442\u044c.")
+
+    def _post(self, payload):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(payload),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        return resp.status, dict(resp.getheaders()), body
+
+
 if __name__ == "__main__":
     unittest.main()
