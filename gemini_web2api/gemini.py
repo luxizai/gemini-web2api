@@ -219,12 +219,12 @@ def clean_text(text: str, strip: bool = True) -> str:
 
 def _extract_texts_from_line(line: str) -> list:
     """Parse a single wrb.fr line and return list of text strings found."""
-    if '"wrb.fr"' not in line or len(line) < 200:
+    if '"wrb.fr"' not in line:
         return []
     try:
         arr = json.loads(line)
         inner_str = arr[0][2]
-        if not inner_str or len(inner_str) < 50:
+        if not inner_str:
             return []
         inner = json.loads(inner_str)
         if not (isinstance(inner, list) and len(inner) > 4 and inner[4]):
@@ -242,9 +242,15 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    bard_err = re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', raw)
     if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+        code = int(bard_err.group(1))
+        hints = {
+            1060: "IP temporarily blocked or region not supported",
+            1037: "usage limit exceeded",
+            1013: "temporary upstream error, retry later",
+        }
+        raise RuntimeError(f"Gemini upstream error [{code}]: {hints.get(code, 'upstream rejected request')}")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -315,10 +321,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        bard_err = re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', buf)
                         if bard_err:
                             raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                                f"Gemini upstream error [{bard_err.group(1)}]"
                             )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)

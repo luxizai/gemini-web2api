@@ -404,17 +404,17 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     buf += chunk
                     if "BardErrorInfo" in buf:
                         import re as _re
-                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        m = _re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', buf)
                         if m:
-                            raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
+                            raise RuntimeError(f"Gemini upstream error [{m.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
-                        if '"wrb.fr"' not in line or len(line) < 200:
+                        if '"wrb.fr"' not in line:
                             continue
                         try:
                             arr = json.loads(line)
                             inner_str = arr[0][2]
-                            if not inner_str or len(inner_str) < 50:
+                            if not inner_str:
                                 continue
                             inner2 = json.loads(inner_str)
                             if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
@@ -453,17 +453,24 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
 def extract_response_text(raw: str) -> str:
     """Parse StreamGenerate response to extract final text."""
     import re as _re
-    bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    bard_err = _re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', raw)
     if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+        code = int(bard_err.group(1))
+        hints = {
+            1060: "IP temporarily blocked or region not supported",
+            1037: "usage limit exceeded",
+            1013: "temporary upstream error, retry later",
+        }
+        hint = hints.get(code, "upstream rejected request")
+        raise RuntimeError(f"Gemini upstream error [{code}]: {hint}")
     texts = []
     for line in raw.split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
+        if '"wrb.fr"' not in line:
             continue
         try:
             arr = json.loads(line)
             inner_str = arr[0][2]
-            if not inner_str or len(inner_str) < 50:
+            if not inner_str:
                 continue
             inner = json.loads(inner_str)
             if isinstance(inner, list) and len(inner) > 4 and inner[4]:
@@ -838,6 +845,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+                # Emit finish chunk so clients don't hang on a dropped stream
+                try:
+                    err_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                 "model": model_name, "choices": [{"index": 0, "delta": {"content": f"[error] {e}"}, "finish_reason": "stop"}]}
+                    self.wfile.write(f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
             return
 
         # Non-streaming (or tool calling which needs full response)
