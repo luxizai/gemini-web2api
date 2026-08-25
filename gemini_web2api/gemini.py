@@ -53,8 +53,8 @@ def load_cookie() -> tuple:
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
-        mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+        st = os.stat(cookie_file)
+        if (st.st_mtime, st.st_size) == (_cookie_cache["mtime"], _cookie_cache.get("size", -1)) and _cookie_cache["str"]:
             return _cookie_cache["str"], _cookie_cache["sapisid"]
         with open(cookie_file, "r") as f:
             content = f.read().strip()
@@ -80,7 +80,7 @@ def load_cookie() -> tuple:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": st.st_mtime, "size": st.st_size})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
