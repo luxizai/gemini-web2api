@@ -91,6 +91,10 @@ MODELS = {
         "mode": 3, "think": 4,
         "desc": "Pro model (requires cookie for real routing)",
     },
+    "gemini-3.1-pro-enhanced": {
+        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
+        "desc": "Pro with enhanced output (experimental)",
+    },
     "gemini-auto": {
         "mode": 4, "think": 4,
         "desc": "Auto model selection",
@@ -240,9 +244,9 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
-    inner = [None] * 80
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -264,6 +268,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            inner[k] = v
 
     outer = [None, json.dumps(inner)]
 
@@ -327,9 +334,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
-    inner = [None] * 80
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -351,6 +358,9 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            inner[k] = v
 
     outer = [None, json.dumps(inner)]
 
@@ -386,7 +396,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -436,7 +446,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             status = getattr(getattr(e, "response", None), "status_code", 0)
             if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
                 log("BL/XSRF refreshed, falling back to non-streaming for this request")
-                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
                 text = extract_response_text(raw)
                 if text:
                     yield text
@@ -794,11 +804,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             think_override = int(think_str)
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
-        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
+            return None, None, None, f"Unknown model: {model_name}", None
+        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None, cfg.get("extra")
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, extra_fields=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -807,7 +817,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -838,7 +848,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -866,7 +876,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -900,7 +910,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = self._resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -955,7 +965,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = upload_images(images)
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1043,7 +1053,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "model not specified in path"}}, 400)
             return
 
-        model_name, model_id, think_mode, err = self._resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = self._resolve_model(model_name)
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -1055,7 +1065,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = upload_images(images)
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs)
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
