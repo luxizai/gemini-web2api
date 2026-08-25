@@ -1,5 +1,7 @@
 """Upstream error detection and parsing edge cases."""
+import http.client
 import json
+import threading
 import unittest
 
 from gemini_web2api.gemini import extract_response_text, _extract_texts_from_line
@@ -30,6 +32,64 @@ class UpstreamErrorTests(unittest.TestCase):
 
     def test_empty_raw(self):
         self.assertEqual(extract_response_text(""), "")
+
+
+class StreamErrorChunkTests(unittest.TestCase):
+    """Upstream failures during SSE streaming must end with a finish chunk + [DONE]."""
+
+    @classmethod
+    def setUpClass(cls):
+        from gemini_web2api.server import GeminiHandler, ThreadedServer
+        cls.server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.port = cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        from gemini_web2api.config import CONFIG
+        self.original_config = dict(CONFIG)
+        CONFIG["api_keys"] = []
+        CONFIG["log_requests"] = False
+
+    def tearDown(self):
+        from gemini_web2api.config import CONFIG
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_stream_error_emits_finish_chunk(self):
+        from unittest import mock
+
+        def failing_stream(*args, **kwargs):
+            yield "partial "
+            raise RuntimeError("Gemini upstream error [1060]: IP temporarily blocked")
+
+        with mock.patch("gemini_web2api.server.generate_stream", side_effect=failing_stream):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps({
+                    "model": "gemini-3.6-flash",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            body = resp.read().decode()
+            conn.close()
+
+        self.assertEqual(resp.status, 200)
+        self.assertIn("partial ", body)
+        self.assertIn("[error] Gemini upstream error [1060]", body)
+        self.assertIn('"finish_reason": "stop"', body)
+        self.assertIn("data: [DONE]", body)
 
 
 if __name__ == "__main__":
