@@ -246,7 +246,7 @@ def extract_response_text(raw: str) -> str:
     if bard_err:
         code = int(bard_err.group(1))
         hints = {
-            1060: "IP temporarily blocked or region not supported",
+            1060: "IP temporarily blocked or region not supported - use a proxy/different network or wait",
             1037: "usage limit exceeded",
             1013: "temporary upstream error, retry later",
         }
