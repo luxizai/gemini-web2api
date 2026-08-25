@@ -282,6 +282,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise RuntimeError("Gemini upstream rate-limited this IP (HTTP 429); retrying immediately would extend the block")
             if e.code in (400, 405) and refresh_bl_and_xsrf():
                 log("Retrying with refreshed BL/XSRF...")
                 last_err = e
