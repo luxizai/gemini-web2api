@@ -249,6 +249,7 @@ def extract_response_text(raw: str) -> str:
             1060: "IP temporarily blocked or region not supported - use a proxy/different network or wait",
             1037: "usage limit exceeded",
             1013: "temporary upstream error, retry later",
+            1185: "upstream rejected request",
         }
         raise RuntimeError(f"Gemini upstream error [{code}]: {hints.get(code, 'upstream rejected request')}")
     last_text = ""
