@@ -275,7 +275,11 @@ resp = client.chat.completions.create(
 - **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
-- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked (upstream error `1060` = IP temporarily blocked - use a proxy/different network or wait). To check whether the IP is currently blocked before debugging the proxy itself, run:
+
+```bash
+python probe_upstream.py
+```
 
 ## Requirements
 

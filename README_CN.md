@@ -248,7 +248,11 @@ resp = client.chat.completions.create(
 - **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
-- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
+- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封 (upstream 错误 `1060` = IP 被临时封禁 - 使用代理/更换网络或等待). 排查代理前可先确认 IP 是否被封:
+
+```bash
+python probe_upstream.py
+```
 
 ## 系统要求
 
