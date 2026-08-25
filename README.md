@@ -130,7 +130,11 @@ Or use the JSON format:
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
 ```
 
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
+**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format (`cookies.txt`). The proxy parses Netscape-format files directly — no conversion needed:
+
+```
+python gemini_web2api.py --cookie-file cookies.txt
+```
 
 ### Authenticated account path and XSRF token
 

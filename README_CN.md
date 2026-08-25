@@ -120,7 +120,11 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 {"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "你的SAPISID值"}
 ```
 
-**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
+**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie (Netscape 格式, `cookies.txt`). 代理可直接解析 Netscape 格式文件, 无需转换:
+
+```
+python gemini_web2api.py --cookie-file cookies.txt
+```
 
 ### 登录账号路径与 XSRF Token
 
