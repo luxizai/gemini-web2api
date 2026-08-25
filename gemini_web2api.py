@@ -749,6 +749,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except json.JSONDecodeError as e:
+            try:
+                self.send_json({"error": {"message": f"invalid JSON: {e}"}}, 400)
+            except:
+                pass
         except Exception as e:
             log(f"POST error: {e}")
             try:
