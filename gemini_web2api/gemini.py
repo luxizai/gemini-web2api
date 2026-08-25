@@ -339,6 +339,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except Exception as e:
+            # Hard upstream rejections (BardErrorInfo) - retrying is futile
+            if "Gemini upstream error" in str(e):
+                raise
             status = getattr(getattr(e, "response", None), "status_code", 0)
             if status in (400, 405) and not emitted_raw_text and refresh_bl_and_xsrf():
                 log("Stream retrying with refreshed BL/XSRF...")

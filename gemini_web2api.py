@@ -430,6 +430,9 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
         except Exception as e:
+            # Hard upstream rejections (BardErrorInfo) - retrying is futile
+            if "Gemini upstream error" in str(e):
+                raise
             status = getattr(getattr(e, "response", None), "status_code", 0)
             if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
                 log("BL/XSRF refreshed, falling back to non-streaming for this request")
