@@ -280,6 +280,15 @@ def _candidate_texts(inner: list) -> list:
     return out
 
 
+def _extract_texts_from_line(line: str) -> list:
+    """Extract candidate text segments from a line (used for legacy callers and tests)."""
+    texts = []
+    for inner in _iter_frames(line):
+        for _, text in _candidate_texts(inner):
+            texts.append(text)
+    return texts
+
+
 def _is_answer_frame(inner: list) -> bool:
     """True for the main answer frame, which carries the new conversation id
     (inner[1], e.g. "c_...") and response id (inner[2], e.g. "r_...").
