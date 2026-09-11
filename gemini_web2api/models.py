@@ -1,7 +1,45 @@
-"""Model definitions and mapping from Gemini frontend JS source."""
+import json
+import uuid
+from typing import Optional
 
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+
+# Model selection header (x-goog-ext-525001261-jspb)
+# Verified internal model IDs (from browser captures, Issue #82).
+# When this header is absent, upstream ignores slot79 and serves the account
+# default model, so model selection silently no-ops.
+MODEL_IDS = {
+    "gemini-3.8-flash": "56fdd199312815e2",
+    "gemini-3.7-flash": "56fdd199312815e2",
+    "gemini-3.6-flash": "56fdd199312815e2",
+    "gemini-3.5-flash": "56fdd199312815e2",
+    "gemini-3.1-pro": "e6fa609c3fa255c0",
+    "gemini-3.1-pro-enhanced": "e6fa609c3fa255c0",
+    "gemini-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.5-flash-thinking": "56fdd199312815e2",
+    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
+    "gemini-auto": None,
+}
+
+
+def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+    """Build the x-goog-ext-525001261-jspb model-selection header.
+
+    idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
+    Returns None for models without a known internal ID (-> account default).
+    """
+    mid = MODEL_IDS.get(model_name)
+    if not mid:
+        return None
+    try:
+        return json.dumps(
+            [1, None, None, None, mid, None, None, 0,
+             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+             None, None, model_id, 0, str(uuid.uuid4())],
+            separators=(",", ":"))
+    except Exception:
+        return None
 
 MODELS = {
     "gemini-3.8-flash": {

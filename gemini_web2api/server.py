@@ -47,6 +47,8 @@ def _upload_images(images: list) -> list:
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -63,7 +65,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _start_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -219,7 +222,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -279,7 +282,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             emitted = 0
             finish = "stop"
             try:
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
                     full_text += delta
                     marker_pos = full_text.find(TOOL_CALL_MARKER)
                     # Without a marker, hold back the last len(marker)-1 chars so a
@@ -319,7 +322,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -412,7 +415,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -605,7 +608,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
                     if not delta:
                         continue
                     full_text += delta
@@ -633,7 +636,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

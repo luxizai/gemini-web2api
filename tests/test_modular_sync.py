@@ -161,6 +161,9 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
+    def test_handler_uses_http_1_0_for_clean_sse_close(self):
+        self.assertEqual(GeminiHandler.protocol_version, "HTTP/1.0")
+
     def post_json(self, path, payload):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(
@@ -205,6 +208,8 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertEqual(headers["Cache-Control"], "no-cache, no-transform")
+        self.assertEqual(headers["X-Accel-Buffering"], "no")
         chunks = [
             json.loads(line[len("data: "):])
             for line in body.splitlines()

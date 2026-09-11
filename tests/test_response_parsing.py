@@ -21,7 +21,9 @@ from gemini_web2api.gemini import (
     extract_response_text,
     generate_stream,
     _next_reqid,
+    _build_headers,
 )
+from gemini_web2api.models import MODEL_IDS, build_model_header
 
 SINGLE_FILE = os.path.join(os.path.dirname(__file__), "..", "gemini_web2api.py")
 
@@ -148,6 +150,40 @@ class SingleFileParityTests(unittest.TestCase):
         draft = "This alternative draft is much longer than the primary answer " * 5
         raw = make_raw(make_line(answer_inner([SHORT_ANSWER], drafts=[(draft,)])))
         self.assertEqual(self.single.extract_response_text(raw), SHORT_ANSWER)
+
+    def test_single_file_build_model_header_parity(self):
+        header_modular = build_model_header("gemini-3.8-flash", 1)
+        header_single = self.single.build_model_header("gemini-3.8-flash", 1)
+        parsed_mod = json.loads(header_modular)
+        parsed_sin = json.loads(header_single)
+        self.assertEqual(parsed_mod[:16], parsed_sin[:16])
+        self.assertIsNone(self.single.build_model_header("gemini-auto", 1))
+
+
+# ─── model routing header ───────────────────────────────────────────────────
+
+class ModelRoutingHeaderTests(unittest.TestCase):
+    def test_known_models_generate_valid_header_json(self):
+        for name in ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-flash-lite"]:
+            header_str = build_model_header(name, 1)
+            self.assertIsNotNone(header_str)
+            parsed = json.loads(header_str)
+            self.assertEqual(parsed[0], 1)
+            self.assertEqual(parsed[4], MODEL_IDS[name])
+            self.assertEqual(parsed[14], 1)
+            self.assertEqual(parsed[15], 0)
+            self.assertTrue(len(parsed[16]) > 0)
+
+    def test_auto_and_unknown_models_return_none(self):
+        self.assertIsNone(build_model_header("gemini-auto", 1))
+        self.assertIsNone(build_model_header("non-existent-model", 1))
+
+    def test_build_headers_injects_model_header_when_present(self):
+        headers = _build_headers(model_name="gemini-3.8-flash", model_id=1)
+        self.assertIn("x-goog-ext-525001261-jspb", headers)
+        headers_auto = _build_headers(model_name="gemini-auto", model_id=1)
+        self.assertNotIn("x-goog-ext-525001261-jspb", headers_auto)
+
 
 
 # ─── request ids ─────────────────────────────────────────────────────────────

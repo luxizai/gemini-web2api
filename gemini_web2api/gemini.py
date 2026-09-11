@@ -20,6 +20,7 @@ except ImportError:
     HAS_HTTPX = False
 
 from .config import CONFIG
+from .models import build_model_header
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
@@ -156,7 +157,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(model_name: str = None, model_id: int = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -172,6 +173,10 @@ def _build_headers() -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if model_name and model_id is not None:
+        hdr = build_model_header(model_name, model_id)
+        if hdr:
+            headers["x-goog-ext-525001261-jspb"] = hdr
     return headers
 
 
@@ -352,7 +357,7 @@ def extract_response_text(raw: str) -> str:
     return clean_text(main_best or any_best)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None) -> str:
     """Non-streaming generation with retry."""
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -361,7 +366,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-            headers = _build_headers()
+            headers = _build_headers(model_name=model_name, model_id=model_id)
             req = urllib.request.Request(_get_url(), data=body, headers=headers, method="POST")
             if proxy:
                 opener = urllib.request.build_opener(
@@ -392,7 +397,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None):
     """Streaming generation via httpx with retry on connection failure.
 
     Only the primary candidate of the main answer frame is streamed.
@@ -402,7 +407,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     splicing unrelated frames into the output.
     """
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
         if text:
             yield text
         return
@@ -416,7 +421,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         raw_lines = []
         try:
             body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-            headers = _build_headers()
+            headers = _build_headers(model_name=model_name, model_id=model_id)
             with client.stream("POST", _get_url(), content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
