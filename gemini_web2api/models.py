@@ -11,12 +11,15 @@ from typing import Optional
 # default model, so model selection silently no-ops.
 MODEL_IDS = {
     "gemini-3.8-flash": "56fdd199312815e2",
+    "gemini-3.8-flash-thinking": "56fdd199312815e2",
     "gemini-3.7-flash": "56fdd199312815e2",
     "gemini-3.6-flash": "56fdd199312815e2",
     "gemini-3.5-flash": "56fdd199312815e2",
     "gemini-3.1-pro": "e6fa609c3fa255c0",
     "gemini-3.1-pro-enhanced": "e6fa609c3fa255c0",
     "gemini-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.5-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.1-flash-lite": "8c46e95b1a07cecc",
     "gemini-3.5-flash-thinking": "56fdd199312815e2",
     "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
     "gemini-auto": None,
@@ -46,6 +49,10 @@ MODELS = {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.8 Flash)",
     },
+    "gemini-3.8-flash-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Deep thinking mode on the latest Flash backend",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "All-around model (Gemini 3.7 Flash)",
@@ -56,7 +63,15 @@ MODELS = {
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
+        "desc": "All-around model (Gemini 3.5 Flash)",
+    },
+    "gemini-3.5-flash-lite": {
+        "mode": 6, "think": 4,
+        "desc": "Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)",
+    },
+    "gemini-3.1-flash-lite": {
+        "mode": 6, "think": 4,
+        "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,

@@ -9,12 +9,22 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls, tool_names
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
-# Fence marker the model is instructed to wrap tool calls in (see tools.py).
-TOOL_CALL_MARKER = "```tool_call"
+# Fence markers the model may wrap tool calls in (see tools.py).
+TOOL_CALL_MARKERS = ("```tool_call", "```function_call", "```json", "[tool_call")
+MAX_TOOL_MARKER_LEN = max(len(m) for m in TOOL_CALL_MARKERS)
+
+
+def _find_tool_marker(text: str) -> int:
+    earliest = -1
+    for marker in TOOL_CALL_MARKERS:
+        pos = text.find(marker)
+        if pos != -1 and (earliest == -1 or pos < earliest):
+            earliest = pos
+    return earliest
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -284,14 +294,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
                     full_text += delta
-                    marker_pos = full_text.find(TOOL_CALL_MARKER)
-                    # Without a marker, hold back the last len(marker)-1 chars so a
+                    marker_pos = _find_tool_marker(full_text)
+                    # Without a marker, hold back the last MAX_TOOL_MARKER_LEN-1 chars so a
                     # fence start split across deltas is not forwarded prematurely.
-                    limit = marker_pos if marker_pos != -1 else len(full_text) - len(TOOL_CALL_MARKER) + 1
+                    limit = marker_pos if marker_pos != -1 else len(full_text) - MAX_TOOL_MARKER_LEN + 1
                     if limit > emitted:
                         send_delta(content=full_text[emitted:limit])
                         emitted = limit
-                clean, tool_calls = parse_tool_calls(full_text)
+                valid_names = tool_names(tools) if tools else None
+                clean, tool_calls = parse_tool_calls(full_text, valid_names=valid_names)
                 if tool_calls:
                     log(f"Chat tool-fenced streaming: parsed {len(tool_calls)} tool call(s)")
                     if len(clean) > emitted:
@@ -329,7 +340,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, valid_names=tool_names(tools))
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -422,7 +433,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, valid_names=tool_names(tools))
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"

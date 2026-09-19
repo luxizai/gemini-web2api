@@ -88,12 +88,15 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.8-flash` | All-around model (latest) | ~12k chars |
+| `gemini-3.8-flash` | Workhorse model, best reasoning & coding (latest) | ~12k chars |
+| `gemini-3.8-flash-thinking` | Extended thinking on latest Flash backend | **~20k chars** |
 | `gemini-3.7-flash` | All-around model | ~12k chars |
 | `gemini-3.6-flash` | All-around model | ~12k chars |
-| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
+| `gemini-3.5-flash` | All-around model | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
+| `gemini-3.5-flash-lite` | Cost-efficient, high capacity | ~10k chars |
+| `gemini-3.1-flash-lite` | Cost-efficient, high capacity | ~10k chars |
 | `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
 | `gemini-3.1-pro-enhanced` | Pro with enhanced output (experimental) | varies |
 | `gemini-auto` | Auto model selection | varies |

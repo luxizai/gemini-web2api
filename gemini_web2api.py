@@ -77,6 +77,10 @@ MODELS = {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.8 Flash)",
     },
+    "gemini-3.8-flash-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Deep thinking mode on the latest Flash backend",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "All-around model (Gemini 3.7 Flash)",
@@ -87,7 +91,15 @@ MODELS = {
     },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
+        "desc": "All-around model (Gemini 3.5 Flash)",
+    },
+    "gemini-3.5-flash-lite": {
+        "mode": 6, "think": 4,
+        "desc": "Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)",
+    },
+    "gemini-3.1-flash-lite": {
+        "mode": 6, "think": 4,
+        "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,
@@ -121,12 +133,15 @@ MODELS = {
 # default model, so model selection silently no-ops.
 MODEL_IDS = {
     "gemini-3.8-flash": "56fdd199312815e2",
+    "gemini-3.8-flash-thinking": "56fdd199312815e2",
     "gemini-3.7-flash": "56fdd199312815e2",
     "gemini-3.6-flash": "56fdd199312815e2",
     "gemini-3.5-flash": "56fdd199312815e2",
     "gemini-3.1-pro": "e6fa609c3fa255c0",
     "gemini-3.1-pro-enhanced": "e6fa609c3fa255c0",
     "gemini-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.5-flash-lite": "8c46e95b1a07cecc",
+    "gemini-3.1-flash-lite": "8c46e95b1a07cecc",
     "gemini-3.5-flash-thinking": "56fdd199312815e2",
     "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
     "gemini-auto": None,
@@ -783,25 +798,147 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(part for part in parts if part), images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
-    tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+def tool_names(tools: list) -> set:
+    """Extract declared function names from an OpenAI tools list."""
+    names = set()
+    for tool in tools or []:
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            names.add(name)
+    return names
+
+
+def _safe_json_loads(raw: str):
+    try:
+        return json.loads(raw.strip())
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return None
+
+
+def _coerce_tool_data(data) -> dict | None:
+    """Validate a parsed candidate as {"name": ..., "arguments": {...}}."""
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if not name or not isinstance(name, str):
+        return None
+    args = data.get("arguments", data.get("args", {}))
+    if isinstance(args, str):
         try:
-            data = json.loads(match.strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return {"name": name, "arguments": args}
+
+
+def _parse_bracket_args(raw: str):
+    """Parse bracket-shorthand args, tolerating a trailing extra brace."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if raw.rstrip().endswith("}"):
+        try:
+            return json.loads(raw.rstrip()[:-1])
+        except (json.JSONDecodeError, ValueError):
             pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-    return clean, tool_calls
+    return None
+
+
+def parse_tool_calls(text: str, valid_names: set = None) -> tuple:
+    """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
+
+    Accepts the formats models emit in practice:
+    1. ```tool_call\\n{"name": ..., "arguments": {...}}\\n``` (canonical)
+    2. ```function_call\\n{...}\\n``` (common variant)
+    3. ```json\\n{"name": ..., "arguments": {...}}\\n``` (bare JSON fence)
+    4. [tool_call: name {...}] (bracket shorthand)
+    5. Raw {"name": ..., "arguments"/"args": {...}} object
+
+    Fences that do not parse as a tool call (e.g. a legit ```json code
+    sample) are left untouched. When valid_names is given, calls to
+    undeclared tools are dropped so clients don't choke on hallucinated
+    tool names.
+    """
+    spans = []  # (start, end, {"name":..., "arguments":...})
+
+    def _collect(pattern, group=1):
+        for m in re.finditer(pattern, text, re.DOTALL):
+            data = _coerce_tool_data(_safe_json_loads(m.group(group)))
+            if data:
+                spans.append((m.start(), m.end(), data))
+
+    _collect(r'```tool_call\s*\n(.*?)\n```')
+    _collect(r'```function_call\s*\n(.*?)\n```')
+    _collect(r'```json\s*\n(.*?)\n```')
+
+    for m in re.finditer(r'\[tool_call\s*:\s*([A-Za-z0-9_.\-]+)\s*(\{.*\})\s*\]',
+                         text, re.DOTALL):
+        args = _parse_bracket_args(m.group(2).strip())
+        if args is not None:
+            data = _coerce_tool_data({"name": m.group(1), "arguments": args})
+            if data:
+                spans.append((m.start(), m.end(), data))
+
+    spans.sort()
+    # Drop overlapping spans (keep the earliest match).
+    merged = []
+    for span in spans:
+        if merged and span[0] < merged[-1][1]:
+            continue
+        merged.append(span)
+
+    clean_parts = []
+    last_end = 0
+    tool_calls = []
+    for start, end, data in merged:
+        clean_parts.append(text[last_end:start])
+        last_end = end
+        if valid_names is not None and data["name"] not in valid_names:
+            continue
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": data["name"],
+                "arguments": json.dumps(data["arguments"], ensure_ascii=False),
+            },
+        })
+    clean_parts.append(text[last_end:])
+
+    if not tool_calls:
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            data = _coerce_tool_data(_safe_json_loads(stripped))
+            if data and (valid_names is None or data["name"] in valid_names):
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": data["name"],
+                        "arguments": json.dumps(data["arguments"], ensure_ascii=False),
+                    },
+                })
+                return "", tool_calls
+
+    return "".join(clean_parts).strip(), tool_calls
+
+
+# Fence markers the model may wrap tool calls in.
+TOOL_CALL_MARKERS = ("```tool_call", "```function_call", "```json", "[tool_call")
+MAX_TOOL_MARKER_LEN = max(len(m) for m in TOOL_CALL_MARKERS)
+
+
+def _find_tool_marker(text: str) -> int:
+    earliest = -1
+    for marker in TOOL_CALL_MARKERS:
+        pos = text.find(marker)
+        if pos != -1 and (earliest == -1 or pos < earliest):
+            earliest = pos
+    return earliest
 
 
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
@@ -950,7 +1087,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, valid_names=tool_names(tools))
         return text or "", tool_calls
 
     def handle_chat(self, body: bytes):
@@ -1010,7 +1147,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             # Stream with tools: stream content deltas as they arrive, but hold
-            # back the ```tool_call fence so they can be parsed into OpenAI
+            # back the tool call fence so they can be parsed into OpenAI
             # tool_calls at end of stream instead of leaking into chat text.
             self._start_sse()
             first_chunk = {
@@ -1044,12 +1181,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name):
                     full_text += delta_text
-                    marker_pos = full_text.find("```tool_call")
-                    limit = marker_pos if marker_pos != -1 else len(full_text) - len("```tool_call") + 1
+                    marker_pos = _find_tool_marker(full_text)
+                    limit = marker_pos if marker_pos != -1 else len(full_text) - MAX_TOOL_MARKER_LEN + 1
                     if limit > emitted:
                         send_delta(content=full_text[emitted:limit])
                         emitted = limit
-                clean, tool_calls = parse_tool_calls(full_text)
+                valid_names = tool_names(tools) if tools else None
+                clean, tool_calls = parse_tool_calls(full_text, valid_names=valid_names)
                 if tool_calls:
                     log(f"Chat tool-fenced streaming: parsed {len(tool_calls)} tool call(s)")
                     if len(clean) > emitted:
