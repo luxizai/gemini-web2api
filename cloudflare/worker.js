@@ -198,7 +198,18 @@ var DEFAULT_CONFIG = {
   // ---- 默认模型 ----
   // 当客户端请求未指定 model 参数时使用的默认模型
   // 可选值参考 MODELS 字典的键名
-  defaultModel: 'gemini-3.6-flash',
+  defaultModel: 'gemini-4-hydrogen',
+
+  // ---- 模型票据覆盖（可选） ----
+  // 通过环境变量 MODEL_TICKETS（JSON 对象）覆盖任意模型的 16 位 hex ticket
+  // 例如: {"gemini-4-hydrogen": "56fdd199312815e2"}
+  modelTickets: {},
+
+  // ---- Gemini 网页 UI 标签清洗 ----
+  // 将 <Steps>/<Step> 转为标准 Markdown 标题，并处理 <ElicitationsGroup>/<FollowUp>
+  cleanUiTags: true,
+  // 'strip' = 移除追问气泡（推荐，默认）；'markdown' = 转为文末建议列表
+  elicitationMode: 'strip',
 
   // ---- API 密钥白名单 ----
   // 用于验证客户端请求的密钥列表
@@ -440,10 +451,30 @@ function getRandomSecChUaPlatform() {
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
 
 var MODELS = {
+  'gemini-4-hydrogen': {
+    mode: 1,        // FAST - 快速模式
+    think: 4,       // AUTO - 自动选择思考深度
+    desc: 'Gemini 4 Hydrogen - fast all-around workhorse model (free tier)',
+  },
+  'gemini-4-hydrogen-thinking': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Gemini 4 Hydrogen with deep thinking enabled',
+  },
+  'gemini-hydrogen': {
+    mode: 1,        // FAST - 快速模式
+    think: 4,       // AUTO
+    desc: 'Alias for gemini-4-hydrogen',
+  },
   'gemini-3.8-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
-    desc: 'Latest all-around model (Gemini 3.8 Flash)',
+    desc: 'All-around model (Gemini 3.8 Flash)',
+  },
+  'gemini-3.8-flash-thinking': {
+    mode: 2,        // THINKING - 深度思考模式
+    think: 0,       // 启用深度思考
+    desc: 'Deep thinking mode on the latest Flash backend',
   },
   'gemini-3.7-flash': {
     mode: 1,        // FAST - 快速模式
@@ -458,7 +489,17 @@ var MODELS = {
   'gemini-3.5-flash': {
     mode: 1,        // FAST
     think: 4,       // AUTO
-    desc: 'Alias for gemini-3.6-flash (backend upgraded)',
+    desc: 'All-around model (Gemini 3.5 Flash)',
+  },
+  'gemini-3.5-flash-lite': {
+    mode: 6,        // FLASH_LITE
+    think: 4,       // AUTO
+    desc: 'Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)',
+  },
+  'gemini-3.1-flash-lite': {
+    mode: 6,        // FLASH_LITE
+    think: 4,       // AUTO
+    desc: 'Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)',
   },
   'gemini-3.5-flash-thinking': {
     mode: 2,        // THINKING - 深度思考模式
@@ -486,6 +527,44 @@ var MODELS = {
     desc: 'Lightweight fast model',
   },
 };
+
+// Model selection header (x-goog-ext-525001261-jspb)
+// Verified internal model IDs; overridable via config.modelTickets / MODEL_TICKETS env var.
+var MODEL_IDS = {
+  'gemini-4-hydrogen': '56fdd199312815e2',
+  'gemini-4-hydrogen-thinking': '56fdd199312815e2',
+  'gemini-hydrogen': '56fdd199312815e2',
+  'gemini-3.8-flash': '56fdd199312815e2',
+  'gemini-3.8-flash-thinking': '56fdd199312815e2',
+  'gemini-3.7-flash': '56fdd199312815e2',
+  'gemini-3.6-flash': '56fdd199312815e2',
+  'gemini-3.5-flash': '56fdd199312815e2',
+  'gemini-3.1-pro': 'e6fa609c3fa255c0',
+  'gemini-flash-lite': '8c46e95b1a07cecc',
+  'gemini-3.5-flash-lite': '8c46e95b1a07cecc',
+  'gemini-3.1-flash-lite': '8c46e95b1a07cecc',
+  'gemini-3.5-flash-thinking': '56fdd199312815e2',
+  'gemini-3.5-flash-thinking-lite': '56fdd199312815e2',
+  'gemini-auto': null,
+};
+
+function buildModelHeader(modelName, modelId, config) {
+  if (!modelName || modelId === undefined || modelId === null) return null;
+  var tickets = (config && config.modelTickets) || {};
+  var mid = Object.prototype.hasOwnProperty.call(tickets, modelName)
+    ? tickets[modelName]
+    : MODEL_IDS[modelName];
+  if (!mid) return null;
+  try {
+    return JSON.stringify([
+      1, null, null, null, mid, null, null, 0,
+      [4, 5, 6, 8, 4, 5, 6, 8], null, null, 2,
+      null, null, modelId, 0, generateUUID(),
+    ]);
+  } catch (e) {
+    return null;
+  }
+}
 
 // ============================================================================
 // 🔑 核心：请求级配置生成器（解决并发串扰 + 多Cookie轮换 + 指纹轮换）
@@ -539,6 +618,9 @@ function getRequestConfig(env) {
     authUser: DEFAULT_CONFIG.authUser,
     xsrfToken: DEFAULT_CONFIG.xsrfToken,
     defaultModel: DEFAULT_CONFIG.defaultModel,
+    modelTickets: {},
+    cleanUiTags: DEFAULT_CONFIG.cleanUiTags,
+    elicitationMode: DEFAULT_CONFIG.elicitationMode,
     apiKeys: DEFAULT_CONFIG.apiKeys,
     cookieString: DEFAULT_CONFIG.cookieString,
     sapisid: DEFAULT_CONFIG.sapisid,
@@ -567,6 +649,23 @@ function getRequestConfig(env) {
   }
   if (env.DEFAULT_MODEL) {
     config.defaultModel = env.DEFAULT_MODEL;
+  }
+  if (env.MODEL_TICKETS) {
+    try {
+      var parsedTickets = JSON.parse(env.MODEL_TICKETS);
+      if (parsedTickets && typeof parsedTickets === 'object') {
+        config.modelTickets = parsedTickets;
+      }
+    } catch (e) {
+      console.error('[ERROR] MODEL_TICKETS 解析失败: ' + e.message);
+    }
+  }
+  if (env.CLEAN_UI_TAGS !== undefined) {
+    var cut = String(env.CLEAN_UI_TAGS).trim().toLowerCase();
+    config.cleanUiTags = !(cut === 'false' || cut === '0' || cut === 'no');
+  }
+  if (env.ELICITATION_MODE) {
+    config.elicitationMode = String(env.ELICITATION_MODE).trim().toLowerCase();
   }
 
   // ---- 认证相关字段：使用 || 操作符确保显式覆盖 ----
@@ -1050,7 +1149,7 @@ function buildUrl(config) {
  * @param {Object} config - 请求级配置对象
  * @returns {Promise<Object>} HTTP 请求头对象
  */
-async function buildHeaders(config) {
+async function buildHeaders(config, modelName, modelId) {
   // 获取多账户 URL 前缀
   var prefix = getAccountPrefix(config);
 
@@ -1110,6 +1209,14 @@ async function buildHeaders(config) {
     headers['Authorization'] = await makeSapisidHash(config.sapisid);
   }
 
+  // 第七步：模型选择路由头（x-goog-ext-525001261-jspb）
+  if (modelName && modelId !== undefined && modelId !== null) {
+    var modelHdr = buildModelHeader(modelName, modelId, config);
+    if (modelHdr) {
+      headers['x-goog-ext-525001261-jspb'] = modelHdr;
+    }
+  }
+
   return headers;
 }
 
@@ -1150,7 +1257,7 @@ async function buildHeaders(config) {
  * @returns {Promise<string>} API 原始响应文本（包含嵌套 JSON）
  * @throws {Error} 所有重试失败后抛出最后的错误
  */
-async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
+async function geminiStreamGenerate(prompt, modelId, thinkMode, config, modelName) {
   // 🎭 请求前添加随机微小延迟（模拟人类操作间隔）
   // 延迟时间在 0 到 fingerprintJitterMs 毫秒之间随机均匀分布
   // 例如 fingerprintJitterMs=1500 时，延迟在 0 到 1.5 秒之间
@@ -1161,7 +1268,7 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
 
   // 构建请求负载、请求头、请求 URL
   var body = buildPayload(prompt, modelId, thinkMode, config);
-  var headers = await buildHeaders(config);
+  var headers = await buildHeaders(config, modelName, modelId);
   var url = buildUrl(config);
 
   // 保存最后一次错误，所有重试失败后抛出
@@ -1173,7 +1280,7 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
       // 🎭 重试时重新构建请求头（使用不同的浏览器指纹）
       // 这增加了重试成功的机会
       if (attempt > 0) {
-        headers = await buildHeaders(config);
+        headers = await buildHeaders(config, modelName, modelId);
         // 重试时也添加新的随机延迟
         // 避免在完全相同的时间点重试
         if (config.fingerprintJitterMs > 0) {
@@ -1286,19 +1393,590 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
  * @param {boolean} [strip] - 是否去除首尾空白字符，默认 true
  * @returns {string} 清理后的文本
  */
-function cleanGeminiText(text, strip) {
-  // 如果未指定 strip 参数，默认值为 true
+var UI_TAG_NAMES = ['Steps', 'Step', 'ElicitationsGroup', 'Elicitation', 'FollowUp'];
+var CARD_URL_PREFIXES = [
+  'http://googleusercontent.com/card_content/',
+  'https://googleusercontent.com/card_content/',
+];
+var CODE_EXEC_INFO_RE = /^(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\s*$/;
+var CODE_EXEC_LANG_PREFIXES = ['python?code_', 'javascript?code_', 'text?code_'];
+var PROSE_SPECIAL_RE = /[ \t\r\n<`~h]/;
+var PROSE_SPECIAL_NO_UI_RE = /[ \t\r\n`~h]/;
+var MAX_UI_TAG_LEN = 2048;
+var MAX_UI_BLOCK_LEN = 32768;
+
+function unescapeHtmlEntities(str) {
+  return String(str || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, function (_, n) { return String.fromCharCode(parseInt(n, 10)); })
+    .replace(/&#x([0-9a-fA-F]+);/g, function (_, n) { return String.fromCharCode(parseInt(n, 16)); })
+    .replace(/&amp;/g, '&');
+}
+
+function matchUiTagPrefix(s) {
+  var pos = s.indexOf('</') === 0 ? 2 : 1;
+  if (pos === s.length) return 'need_more';
+  var j = pos;
+  while (j < s.length) {
+    var code = s.charCodeAt(j);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+      j++;
+    } else {
+      break;
+    }
+  }
+  var name = s.slice(pos, j);
+  if (j === s.length) {
+    if (name) {
+      for (var i = 0; i < UI_TAG_NAMES.length; i++) {
+        if (UI_TAG_NAMES[i].indexOf(name) === 0) return 'need_more';
+      }
+    }
+    return 'no';
+  }
+  var delim = s.charAt(j);
+  if (
+    UI_TAG_NAMES.indexOf(name) !== -1 &&
+    (delim === ' ' || delim === '\t' || delim === '\r' || delim === '\n' || delim === '>' || delim === '/')
+  ) {
+    return 'match';
+  }
+  return 'no';
+}
+
+function findTagEnd(s) {
+  var quote = null;
+  for (var pos = 1; pos < s.length; pos++) {
+    var ch = s.charAt(pos);
+    if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return pos;
+    }
+  }
+  return -1;
+}
+
+function parseUiTag(tagStr) {
+  var inner = tagStr.slice(1, -1).trim();
+  if (inner.charAt(0) === '/') {
+    return { name: inner.slice(1).trim(), isClosing: true, isSelfClosing: false, attrs: {} };
+  }
+  var isSelfClosing = inner.charAt(inner.length - 1) === '/';
+  if (isSelfClosing) {
+    inner = inner.slice(0, -1).replace(/\s+$/, '');
+  }
+  var m = inner.match(/^([A-Za-z]+)([\s\S]*)$/);
+  var name = m ? m[1] : inner;
+  var attrStr = m ? m[2] : '';
+  var attrs = {};
+  var attrRe = /([A-Za-z_][\w:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  var am;
+  while ((am = attrRe.exec(attrStr)) !== null) {
+    attrs[am[1]] = unescapeHtmlEntities(am[2] !== undefined ? am[2] : am[3]);
+  }
+  return { name: name, isClosing: false, isSelfClosing: isSelfClosing, attrs: attrs };
+}
+
+function isClosingFence(line, fenceChar, fenceLen) {
+  var stripped = line.replace(/[ \t\r]+$/, '');
+  var trimmedLeft = stripped.replace(/^ +/, '');
+  var indent = stripped.length - trimmedLeft.length;
+  if (indent > 3 || trimmedLeft.length < fenceLen) return false;
+  for (var i = 0; i < trimmedLeft.length; i++) {
+    if (trimmedLeft.charAt(i) !== fenceChar) return false;
+  }
+  return true;
+}
+
+function formatElicitationBlock(message, inner) {
+  var items = [];
+  var pos = 0;
+  while (pos < inner.length) {
+    var idx = inner.indexOf('<Elicitation', pos);
+    if (idx === -1) break;
+    var after = idx + 12;
+    var delim = inner.charAt(after);
+    if (
+      after >= inner.length ||
+      (delim !== ' ' && delim !== '\t' && delim !== '\r' && delim !== '\n' && delim !== '>' && delim !== '/')
+    ) {
+      pos = after;
+      continue;
+    }
+    var end = findTagEnd(inner.slice(idx));
+    if (end === -1) break;
+    var parsed = parseUiTag(inner.slice(idx, idx + end + 1));
+    if (!parsed.isClosing) {
+      var item = (parsed.attrs.label || parsed.attrs.query || '').trim();
+      if (item) items.push(item);
+    }
+    pos = idx + end + 1;
+  }
+  var lines = [];
+  if (message) lines.push('**' + message + '**');
+  for (var i = 0; i < items.length; i++) {
+    lines.push('- ' + items[i]);
+  }
+  if (lines.length === 0) return '';
+  return '---\n\n' + lines.join('\n');
+}
+
+function createStreamTextCleaner(options) {
+  var opts = options || {};
+  var cleanUiTags = opts.cleanUiTags !== undefined ? Boolean(opts.cleanUiTags) : true;
+  var elicitationMode = String(opts.elicitationMode || 'strip').toLowerCase();
+
+  var buf = '';
+  var pendingWs = '';
+  var skipWs = false;
+  var needBlockSep = false;
+  var hasOutput = false;
+  var trailingNewlines = 0;
+  var inCodeFence = false;
+  var suppressFence = false;
+  var fenceChar = '';
+  var fenceLen = 0;
+  var fenceLineBuf = '';
+  var inlineTicks = 0;
+  var stepIndex = 0;
+  var blockTag = null;
+  var blockAttrs = {};
+  var blockBuf = '';
+
+  function appendOut(out, text) {
+    if (!text) return;
+    out.push(text);
+    hasOutput = true;
+    var nl = 0;
+    var allNl = true;
+    for (var i = text.length - 1; i >= 0; i--) {
+      var ch = text.charAt(i);
+      if (ch === '\n') nl++;
+      else if (ch === '\r') continue;
+      else { allNl = false; break; }
+    }
+    trailingNewlines = Math.min(2, allNl ? trailingNewlines + nl : nl);
+  }
+
+  function emitBlockSep(out) {
+    if (hasOutput) {
+      var need = 2 - trailingNewlines;
+      if (need > 0) appendOut(out, need === 2 ? '\n\n' : '\n');
+    }
+  }
+
+  function flushWsBeforeVisible(out) {
+    if (needBlockSep) {
+      emitBlockSep(out);
+      needBlockSep = false;
+      pendingWs = '';
+      skipWs = false;
+    } else if (pendingWs) {
+      appendOut(out, pendingWs);
+      pendingWs = '';
+    }
+    skipWs = false;
+  }
+
+  function atFenceStart() {
+    if (needBlockSep) return true;
+    var nlIdx = pendingWs.lastIndexOf('\n');
+    if (nlIdx !== -1) {
+      var tail = pendingWs.slice(nlIdx + 1);
+      return tail.length <= 3 && /^ *$/.test(tail);
+    }
+    if (!hasOutput || trailingNewlines >= 1) {
+      return pendingWs.length <= 3 && /^ *$/.test(pendingWs);
+    }
+    return false;
+  }
+
+  function finishBlock(out, tag, attrs, inner) {
+    if (elicitationMode === 'markdown') {
+      var md = '';
+      if (tag === 'ElicitationsGroup') {
+        md = formatElicitationBlock((attrs.message || '').trim(), inner);
+      } else {
+        var label = (attrs.label || attrs.query || inner || '').trim();
+        md = label ? '- ' + label : '';
+      }
+      if (md) {
+        pendingWs = '';
+        emitBlockSep(out);
+        appendOut(out, md);
+        skipWs = true;
+        needBlockSep = true;
+        return;
+      }
+    }
+    pendingWs = '';
+    skipWs = true;
+    if (hasOutput) needBlockSep = true;
+  }
+
+  function process(final) {
+    var out = [];
+    var specialRe = cleanUiTags ? PROSE_SPECIAL_RE : PROSE_SPECIAL_NO_UI_RE;
+
+    while (buf.length > 0 || (final && blockTag)) {
+      if (blockTag) {
+        if (buf) {
+          blockBuf += buf;
+          buf = '';
+        }
+        var closeRe = new RegExp('</' + blockTag + '\\s*>');
+        var bm = closeRe.exec(blockBuf);
+        if (bm) {
+          var inner = blockBuf.slice(0, bm.index);
+          var rest = blockBuf.slice(bm.index + bm[0].length);
+          var finishedTag = blockTag;
+          var finishedAttrs = blockAttrs;
+          blockTag = null;
+          blockAttrs = {};
+          blockBuf = '';
+          buf = rest;
+          finishBlock(out, finishedTag, finishedAttrs, inner);
+          continue;
+        }
+        if (final || blockBuf.length > MAX_UI_BLOCK_LEN) {
+          var abortTag = blockTag;
+          var abortAttrs = blockAttrs;
+          var abortInner = blockBuf;
+          blockTag = null;
+          blockAttrs = {};
+          blockBuf = '';
+          finishBlock(out, abortTag, abortAttrs, abortInner);
+          continue;
+        }
+        break;
+      }
+
+      if (inCodeFence) {
+        var nl = buf.indexOf('\n');
+        if (suppressFence) {
+          if (nl !== -1) {
+            var line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (isClosingFence(line, fenceChar, fenceLen)) {
+              inCodeFence = false;
+              suppressFence = false;
+            }
+            continue;
+          }
+          if (final) {
+            buf = '';
+            inCodeFence = false;
+            suppressFence = false;
+          }
+          break;
+        }
+        if (nl !== -1) {
+          var part = buf.slice(0, nl + 1);
+          buf = buf.slice(nl + 1);
+          var fullLine = fenceLineBuf + part.slice(0, -1);
+          fenceLineBuf = '';
+          appendOut(out, part);
+          if (isClosingFence(fullLine, fenceChar, fenceLen)) {
+            inCodeFence = false;
+          }
+          continue;
+        }
+        var chunk = buf;
+        buf = '';
+        if (fenceLineBuf.length < 64) {
+          fenceLineBuf += chunk.slice(0, 64 - fenceLineBuf.length);
+        }
+        appendOut(out, chunk);
+        if (final && isClosingFence(fenceLineBuf, fenceChar, fenceLen)) {
+          inCodeFence = false;
+          fenceLineBuf = '';
+        }
+        break;
+      }
+
+      if (inlineTicks > 0) {
+        var im = /[`\n]/.exec(buf);
+        if (!im) {
+          appendOut(out, buf);
+          buf = '';
+          break;
+        }
+        if (im.index > 0) {
+          appendOut(out, buf.slice(0, im.index));
+          buf = buf.slice(im.index);
+          continue;
+        }
+        if (buf.charAt(0) === '\n') {
+          appendOut(out, '\n');
+          buf = buf.slice(1);
+          if (trailingNewlines >= 2) inlineTicks = 0;
+          continue;
+        }
+        var tickCount = 0;
+        while (tickCount < buf.length && buf.charAt(tickCount) === '`') tickCount++;
+        if (tickCount === buf.length && !final) break;
+        appendOut(out, buf.slice(0, tickCount));
+        buf = buf.slice(tickCount);
+        if (tickCount === inlineTicks) inlineTicks = 0;
+        continue;
+      }
+
+      var ch = buf.charAt(0);
+      if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+        var wsPos = 1;
+        while (wsPos < buf.length) {
+          var wch = buf.charAt(wsPos);
+          if (wch === ' ' || wch === '\t' || wch === '\r' || wch === '\n') wsPos++;
+          else break;
+        }
+        var ws = buf.slice(0, wsPos);
+        buf = buf.slice(wsPos);
+        if (!skipWs) pendingWs += ws;
+        continue;
+      }
+
+      if (ch === 'h') {
+        var isCardPartial = false;
+        var matchedCardPrefix = null;
+        for (var ci = 0; ci < CARD_URL_PREFIXES.length; ci++) {
+          var cp = CARD_URL_PREFIXES[ci];
+          if (cp.indexOf(buf) === 0) { isCardPartial = true; break; }
+          if (buf.indexOf(cp) === 0) { matchedCardPrefix = cp; break; }
+        }
+        if (isCardPartial && !final) break;
+        if (matchedCardPrefix) {
+          var dEnd = matchedCardPrefix.length;
+          while (dEnd < buf.length && buf.charCodeAt(dEnd) >= 48 && buf.charCodeAt(dEnd) <= 57) {
+            dEnd++;
+          }
+          if (dEnd === buf.length && !final) break;
+          if (dEnd > matchedCardPrefix.length) {
+            if (dEnd < buf.length && buf.charAt(dEnd) === '\r') {
+              if (dEnd + 1 === buf.length && !final) break;
+              if (dEnd + 1 < buf.length && buf.charAt(dEnd + 1) === '\n') dEnd += 2;
+            } else if (dEnd < buf.length && buf.charAt(dEnd) === '\n') {
+              dEnd += 1;
+            }
+            buf = buf.slice(dEnd);
+            continue;
+          }
+        }
+        flushWsBeforeVisible(out);
+        appendOut(out, 'h');
+        buf = buf.slice(1);
+        continue;
+      }
+
+      if (ch === '`' || ch === '~') {
+        var count = 0;
+        while (count < buf.length && buf.charAt(count) === ch) count++;
+        if (count === buf.length && !final) break;
+        if (ch === '~') {
+          if (count >= 3 && atFenceStart()) {
+            var tnl = buf.indexOf('\n', count);
+            if (tnl === -1 && !final) break;
+            var tend = tnl !== -1 ? tnl + 1 : buf.length;
+            flushWsBeforeVisible(out);
+            appendOut(out, buf.slice(0, tend));
+            buf = buf.slice(tend);
+            inCodeFence = true;
+            suppressFence = false;
+            fenceChar = '~';
+            fenceLen = count;
+            fenceLineBuf = '';
+            continue;
+          }
+          flushWsBeforeVisible(out);
+          appendOut(out, buf.slice(0, count));
+          buf = buf.slice(count);
+          continue;
+        }
+        if (count < 3) {
+          flushWsBeforeVisible(out);
+          appendOut(out, buf.slice(0, count));
+          buf = buf.slice(count);
+          inlineTicks = count;
+          continue;
+        }
+        if (atFenceStart()) {
+          var fnl = buf.indexOf('\n', count);
+          if (fnl === -1 && !final) break;
+          var info = buf.slice(count, fnl !== -1 ? fnl : buf.length);
+          var fend = fnl !== -1 ? fnl + 1 : buf.length;
+          if (CODE_EXEC_INFO_RE.test(info)) {
+            buf = buf.slice(fend);
+            inCodeFence = true;
+            suppressFence = true;
+            fenceChar = '`';
+            fenceLen = count;
+            continue;
+          }
+          flushWsBeforeVisible(out);
+          appendOut(out, buf.slice(0, fend));
+          buf = buf.slice(fend);
+          inCodeFence = true;
+          suppressFence = false;
+          fenceChar = '`';
+          fenceLen = count;
+          fenceLineBuf = '';
+          continue;
+        }
+        var after = buf.slice(count);
+        var langPartial = false;
+        var langMatched = false;
+        for (var li = 0; li < CODE_EXEC_LANG_PREFIXES.length; li++) {
+          var lp = CODE_EXEC_LANG_PREFIXES[li];
+          if (lp.indexOf(after) === 0) { langPartial = true; break; }
+          if (after.indexOf(lp) === 0) { langMatched = true; break; }
+        }
+        if (langPartial && !final) break;
+        if (langMatched) {
+          var mnl = buf.indexOf('\n', count);
+          if (mnl === -1 && !final) break;
+          var minfo = buf.slice(count, mnl !== -1 ? mnl : buf.length);
+          if (CODE_EXEC_INFO_RE.test(minfo)) {
+            var mend = mnl !== -1 ? mnl + 1 : buf.length;
+            buf = buf.slice(mend);
+            inCodeFence = true;
+            suppressFence = true;
+            fenceChar = '`';
+            fenceLen = count;
+            continue;
+          }
+        }
+        flushWsBeforeVisible(out);
+        appendOut(out, buf.slice(0, count));
+        buf = buf.slice(count);
+        inlineTicks = count;
+        continue;
+      }
+
+      if (ch === '<' && cleanUiTags) {
+        var status = matchUiTagPrefix(buf);
+        if (status === 'need_more') {
+          if (!final) break;
+        } else if (status === 'match') {
+          var endPos = findTagEnd(buf);
+          if (endPos === -1) {
+            if (!final && buf.length <= MAX_UI_TAG_LEN) break;
+            if (final && elicitationMode === 'strip' && /^<\/?(?:ElicitationsGroup|Elicitation|FollowUp)\b/.test(buf)) {
+              buf = '';
+              pendingWs = '';
+              skipWs = true;
+              break;
+            }
+          } else {
+            var tagStr = buf.slice(0, endPos + 1);
+            buf = buf.slice(endPos + 1);
+            var parsed = parseUiTag(tagStr);
+            if (parsed.name === 'Steps') {
+              stepIndex = 0;
+              pendingWs = '';
+              skipWs = true;
+              if (hasOutput) needBlockSep = true;
+            } else if (parsed.name === 'Step') {
+              if (parsed.isClosing) {
+                pendingWs = '';
+                skipWs = true;
+                if (hasOutput) needBlockSep = true;
+              } else {
+                stepIndex++;
+                var title = (parsed.attrs.title || '').trim();
+                var subtitle = (parsed.attrs.subtitle || '').trim();
+                var heading;
+                if (title && subtitle) heading = '#### ' + stepIndex + '. ' + title + ' — ' + subtitle;
+                else if (title) heading = '#### ' + stepIndex + '. ' + title;
+                else if (subtitle) heading = '#### ' + stepIndex + '. ' + subtitle;
+                else heading = '#### Step ' + stepIndex;
+                pendingWs = '';
+                emitBlockSep(out);
+                appendOut(out, heading);
+                needBlockSep = true;
+                skipWs = true;
+              }
+            } else if (
+              parsed.name === 'ElicitationsGroup' ||
+              parsed.name === 'Elicitation' ||
+              parsed.name === 'FollowUp'
+            ) {
+              if (parsed.isClosing) {
+                pendingWs = '';
+                skipWs = true;
+                if (hasOutput) needBlockSep = true;
+              } else if (parsed.isSelfClosing) {
+                if (
+                  elicitationMode === 'markdown' &&
+                  (parsed.name === 'Elicitation' || parsed.name === 'FollowUp')
+                ) {
+                  var flabel = (parsed.attrs.label || parsed.attrs.query || '').trim();
+                  if (flabel) {
+                    pendingWs = '';
+                    emitBlockSep(out);
+                    appendOut(out, '- ' + flabel);
+                    skipWs = true;
+                    needBlockSep = true;
+                  } else {
+                    pendingWs = '';
+                    skipWs = true;
+                  }
+                } else {
+                  pendingWs = '';
+                  skipWs = true;
+                  if (hasOutput) needBlockSep = true;
+                }
+              } else {
+                blockTag = parsed.name;
+                blockAttrs = parsed.attrs;
+                blockBuf = '';
+              }
+            }
+            continue;
+          }
+        }
+        flushWsBeforeVisible(out);
+        appendOut(out, '<');
+        buf = buf.slice(1);
+        continue;
+      }
+
+      var restTail = buf.slice(1);
+      var pm = specialRe.exec(restTail);
+      var runEnd = pm ? pm.index + 1 : buf.length;
+      flushWsBeforeVisible(out);
+      appendOut(out, buf.slice(0, runEnd));
+      buf = buf.slice(runEnd);
+    }
+
+    if (final && pendingWs && !skipWs) {
+      appendOut(out, pendingWs);
+      pendingWs = '';
+    }
+    return out.join('');
+  }
+
+  return {
+    feed: function (chunk) {
+      if (!chunk) return '';
+      buf += chunk;
+      return process(false);
+    },
+    flush: function () {
+      return process(true);
+    },
+  };
+}
+
+function cleanGeminiText(text, strip, options) {
   if (strip === undefined) strip = true;
-
-  // 移除代码执行块
-  // 使用全局替换（g 标志）和多行模式（s 标志，允许 . 匹配换行符）
-  text = text.replace(
-    /```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n[\s\S]*?```\n?/g,
-    ''
-  );
-
-  // 根据 strip 参数决定是否去除首尾空白
-  return strip ? text.trim() : text;
+  var cleaner = createStreamTextCleaner(options);
+  var result = cleaner.feed(text || '') + cleaner.flush();
+  return strip ? result.trim() : result;
 }
 
 /**
@@ -1420,7 +2098,7 @@ function bestMainAnswer(line) {
  * @returns {string} 提取并清理后的最终答案
  * @throws {Error} 如果检测到 BardErrorInfo 错误
  */
-function extractResponseText(raw) {
+function extractResponseText(raw, config) {
   // 第一步：检查 BardErrorInfo 错误
   // 格式: BardErrorInfo [错误代码]
   // 例如: BardErrorInfo [10] 表示请求被拒绝
@@ -1451,8 +2129,11 @@ function extractResponseText(raw) {
     }
   }
 
-  // 清理代码执行痕迹并返回
-  return cleanGeminiText(mainBest || anyBest);
+  // 清理代码执行痕迹和 Gemini 网页 UI 标签并返回
+  var opts = config
+    ? { cleanUiTags: config.cleanUiTags, elicitationMode: config.elicitationMode }
+    : undefined;
+  return cleanGeminiText(mainBest || anyBest, true, opts);
 }
 
 // ============================================================================
@@ -1925,11 +2606,18 @@ function sendSSE(stream) {
  */
 function resolveModel(modelName) {
   var thinkOverride = null;
-  var actualModelName = modelName;
+  var actualModelName = String(modelName || '').trim();
+  if (actualModelName.indexOf('/') !== -1 && !MODELS[actualModelName]) {
+    var slashParts = actualModelName.split('/');
+    var candidate = slashParts[slashParts.length - 1];
+    if (MODELS[candidate.split('@think=')[0]]) {
+      actualModelName = candidate;
+    }
+  }
 
   // 检查是否包含 @think= 参数
-  if (modelName.indexOf('@think=') !== -1) {
-    var parts = modelName.split('@think=');
+  if (actualModelName.indexOf('@think=') !== -1) {
+    var parts = actualModelName.split('@think=');
     actualModelName = parts[0];           // 提取真正的模型名称
     thinkOverride = parseInt(parts[1], 10);  // 提取思考模式覆盖值
     if (isNaN(thinkOverride)) {
@@ -2015,10 +2703,10 @@ async function handleChatCompletions(request, body, config) {
   if (!stream || tools) {
     try {
       // 调用 Gemini API 获取完整响应
-      var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
+      var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, modelName);
 
       // 提取并清理响应文本
-      var text = extractResponseText(raw);
+      var text = extractResponseText(raw, config);
       var toolCalls = null;
 
       // 如果启用了工具，解析工具调用
@@ -2171,7 +2859,7 @@ async function handleChatCompletions(request, body, config) {
 
           // ---- 第三步：构建并发送 Gemini 请求 ----
           var reqBody = buildPayload(prompt, modelId, thinkMode, config);
-          var headers = await buildHeaders(config);
+          var headers = await buildHeaders(config, modelName, modelId);
           var url = buildUrl(config);
 
           // 创建独立的 AbortController 用于超时控制
@@ -2208,6 +2896,10 @@ async function handleChatCompletions(request, body, config) {
             var prevText = '';    // 记录之前已发送的完整文本
             var emittedAny = false;  // 是否已向客户端推送过内容
             var rawLines = [];       // 已完成的行（流结束时兜底重扫用）
+            var cleaner = createStreamTextCleaner({
+              cleanUiTags: config.cleanUiTags,
+              elicitationMode: config.elicitationMode,
+            });
 
             while (true) {
               var readResult = await reader.read();
@@ -2253,12 +2945,16 @@ async function handleChatCompletions(request, body, config) {
                   }
                   // 尚未推送任何内容：丢弃噪音基线，采用真正的答案
                   prevText = '';
+                  cleaner = createStreamTextCleaner({
+                    cleanUiTags: config.cleanUiTags,
+                    elicitationMode: config.elicitationMode,
+                  });
                 }
 
                 // 🔑 计算增量文本（保证是同一答案的延伸，而非无关文本的切片）
                 var delta = current.slice(prevText.length);
-                // 清理代码执行痕迹（不 trim，保留空白格式）
-                var cleaned = cleanGeminiText(delta, false);
+                // 增量清理代码执行痕迹和 Gemini 网页 UI 标签
+                var cleaned = cleaner.feed(delta);
                 if (cleaned) {
                   emittedAny = true;
                   // 立即将增量块推送给客户端（打字机效果）
@@ -2279,12 +2975,29 @@ async function handleChatCompletions(request, body, config) {
               }
             }
 
+            // 冲刷流式清洗器缓冲区中的剩余文本
+            var tailCleaned = cleaner.flush();
+            if (tailCleaned) {
+              emittedAny = true;
+              controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created: timestamp(),
+                model: modelName,
+                choices: [{
+                  index: 0,
+                  delta: { content: tailCleaned },
+                  finish_reason: null
+                }],
+              }) + '\n\n'));
+            }
+
             // ---- 第四步半：流结束兜底 ----
             // 严格解析器全程未匹配到主答案框架（协议漂移）时，对缓冲的
             // 完整响应做降级重扫，避免给客户端返回空流
             if (!emittedAny && rawLines.length > 0) {
               try {
-                var fallbackText = extractResponseText(rawLines.join('\n'));
+                var fallbackText = extractResponseText(rawLines.join('\n'), config);
                 if (fallbackText) {
                   controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
                     id: chatId,
@@ -2443,8 +3156,8 @@ async function handleResponses(request, body, config) {
 
   try {
     // 调用 Gemini API
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
-    var text = extractResponseText(raw);
+    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, modelName);
+    var text = extractResponseText(raw, config);
     var toolCalls = null;
 
     // 解析工具调用
@@ -2541,8 +3254,8 @@ async function handleGoogleAPI(request, body, stream, config) {
   }
 
   try {
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
-    var text = extractResponseText(raw);
+    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, modelName);
+    var text = extractResponseText(raw, config);
 
     // 构建 Google 格式的响应
     var response = {

@@ -2,6 +2,8 @@ import json
 import uuid
 from typing import Optional
 
+from .config import CONFIG
+
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
@@ -9,7 +11,11 @@ from typing import Optional
 # Verified internal model IDs (from browser captures, Issue #82).
 # When this header is absent, upstream ignores slot79 and serves the account
 # default model, so model selection silently no-ops.
+# Users can override any model's 16-hex ticket via CONFIG["model_tickets"].
 MODEL_IDS = {
+    "gemini-4-hydrogen": "56fdd199312815e2",
+    "gemini-4-hydrogen-thinking": "56fdd199312815e2",
+    "gemini-hydrogen": "56fdd199312815e2",
     "gemini-3.8-flash": "56fdd199312815e2",
     "gemini-3.8-flash-thinking": "56fdd199312815e2",
     "gemini-3.7-flash": "56fdd199312815e2",
@@ -26,13 +32,20 @@ MODEL_IDS = {
 }
 
 
-def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+def build_model_header(
+    model_name: str, model_id: int, model_tickets: Optional[dict] = None
+) -> Optional[str]:
     """Build the x-goog-ext-525001261-jspb model-selection header.
 
     idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
+    Checks model_tickets (or CONFIG["model_tickets"]) before MODEL_IDS.
     Returns None for models without a known internal ID (-> account default).
     """
-    mid = MODEL_IDS.get(model_name)
+    tickets = model_tickets if model_tickets is not None else (CONFIG.get("model_tickets") or {})
+    if model_name in tickets:
+        mid = tickets.get(model_name)
+    else:
+        mid = MODEL_IDS.get(model_name)
     if not mid:
         return None
     try:
@@ -45,9 +58,21 @@ def build_model_header(model_name: str, model_id: int) -> Optional[str]:
         return None
 
 MODELS = {
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 4 Hydrogen - fast all-around workhorse model (free tier)",
+    },
+    "gemini-4-hydrogen-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Hydrogen with deep thinking enabled",
+    },
+    "gemini-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-4-hydrogen",
+    },
     "gemini-3.8-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+        "desc": "All-around model (Gemini 3.8 Flash)",
     },
     "gemini-3.8-flash-thinking": {
         "mode": 2, "think": 0,
@@ -100,12 +125,20 @@ MODELS = {
 }
 
 
-def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
+def resolve_model(model_name: str, default: Optional[str] = None):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,
     since upstream clients may request arbitrary model identifiers.
     """
+    if default is None or default not in MODELS:
+        cfg_default = CONFIG.get("default_model")
+        default = cfg_default if cfg_default in MODELS else "gemini-4-hydrogen"
+    model_name = (model_name or default).strip() if isinstance(model_name, str) else default
+    if "/" in model_name and model_name not in MODELS:
+        candidate = model_name.rsplit("/", 1)[-1]
+        if candidate.rsplit("@think=", 1)[0] in MODELS:
+            model_name = candidate
     think_override = None
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)

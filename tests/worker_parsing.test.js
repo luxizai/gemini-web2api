@@ -34,7 +34,18 @@ vm.createContext(sandbox);
 const script = source.replace(/^export\s+default\s*\{/m, 'globalThis.__workerDefault = {');
 vm.runInContext(script, sandbox);
 
-const { iterFrames, candidateTexts, isAnswerFrame, bestMainAnswer, extractResponseText, nextReqid } = sandbox;
+const {
+  iterFrames,
+  candidateTexts,
+  isAnswerFrame,
+  bestMainAnswer,
+  extractResponseText,
+  nextReqid,
+  resolveModel,
+  buildModelHeader,
+  cleanGeminiText,
+  createStreamTextCleaner,
+} = sandbox;
 
 // ─── wire-format builders (mirror the Python tests) ─────────────────────────
 function makeLine(...inners) {
@@ -134,6 +145,48 @@ const ids = [];
 for (let i = 0; i < 50; i++) ids.push(nextReqid());
 check('reqids unique', new Set(ids).size, 50);
 check('reqids increasing', JSON.stringify(ids), JSON.stringify([...ids].sort((a, b) => a - b)));
+
+// 11. gemini-4-hydrogen routing & ticket override
+const resolvedH = resolveModel('gemini-4-hydrogen');
+check('resolve gemini-4-hydrogen mode', resolvedH.modelId, 1);
+check('resolve gemini-4-hydrogen think', resolvedH.thinkMode, 4);
+const resolvedPrefix = resolveModel('google/gemini-4-hydrogen@think=2');
+check('resolve prefixed hydrogen model', resolvedPrefix.modelName, 'gemini-4-hydrogen');
+check('resolve prefixed hydrogen think', resolvedPrefix.thinkMode, 2);
+const hdr = JSON.parse(buildModelHeader('gemini-4-hydrogen', 1, { modelTickets: {} }));
+check('hydrogen default ticket header', hdr[4], '56fdd199312815e2');
+const hdrOverride = JSON.parse(buildModelHeader('gemini-4-hydrogen', 1, { modelTickets: { 'gemini-4-hydrogen': 'cafebabe12345678' } }));
+check('hydrogen ticket override', hdrOverride[4], 'cafebabe12345678');
+
+// 12. UI tag cleaning & char-by-char streaming invariance
+const uiSample =
+  '排查与解决步骤\n\n' +
+  '<Steps> <Step subtitle="终端操作" title="先结束当前卡住的 Git 操作"> 输入 `n` 并回车。 </Step> ' +
+  '<Step subtitle="Windows" title="释放进程"> 关闭 `git.exe`。 </Step> </Steps>\n\n' +
+  '补充处理。\n\n' +
+  '<ElicitationsGroup message="继续排查："> <Elicitation label="macOS 或 Linux" query="q1" /> </ElicitationsGroup>';
+const expectedUi =
+  '排查与解决步骤\n\n' +
+  '#### 1. 先结束当前卡住的 Git 操作 — 终端操作\n\n' +
+  '输入 `n` 并回车。\n\n' +
+  '#### 2. 释放进程 — Windows\n\n' +
+  '关闭 `git.exe`。\n\n' +
+  '补充处理。';
+check('cleanGeminiText converts Steps and strips ElicitationsGroup', cleanGeminiText(uiSample), expectedUi);
+
+const cleaner = createStreamTextCleaner();
+let streamed = '';
+for (let i = 0; i < uiSample.length; i++) streamed += cleaner.feed(uiSample[i]);
+streamed += cleaner.flush();
+check('worker char-by-char streaming matches cleanGeminiText', streamed, expectedUi);
+
+const mdCleaned = cleanGeminiText(uiSample, true, { elicitationMode: 'markdown' });
+check('worker markdown elicitation mode', mdCleaned.includes('**继续排查：**\n- macOS 或 Linux'), true);
+
+const codeBlockSample = '```jsx\n<Steps><Step title="Demo">keep</Step></Steps>\n```\n\n<Steps><Step title="Real">ok</Step></Steps>';
+const codeCleaned = cleanGeminiText(codeBlockSample);
+check('worker preserves tags inside fenced code block', codeCleaned.includes('<Step title="Demo">keep</Step>'), true);
+check('worker converts tags outside fenced code block', codeCleaned.includes('#### 1. Real\n\nok'), true);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

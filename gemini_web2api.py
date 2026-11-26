@@ -28,6 +28,7 @@ import ssl
 import sys
 import uuid
 import re
+import html
 import os
 import random
 import threading
@@ -58,12 +59,15 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-4-hydrogen",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "model_tickets": {},
+    "clean_ui_tags": True,
+    "elicitation_mode": "strip",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -73,9 +77,21 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 4 Hydrogen - fast all-around workhorse model (free tier)",
+    },
+    "gemini-4-hydrogen-thinking": {
+        "mode": 2, "think": 0,
+        "desc": "Gemini 4 Hydrogen with deep thinking enabled",
+    },
+    "gemini-hydrogen": {
+        "mode": 1, "think": 4,
+        "desc": "Alias for gemini-4-hydrogen",
+    },
     "gemini-3.8-flash": {
         "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.8 Flash)",
+        "desc": "All-around model (Gemini 3.8 Flash)",
     },
     "gemini-3.8-flash-thinking": {
         "mode": 2, "think": 0,
@@ -131,7 +147,11 @@ MODELS = {
 # Verified internal model IDs (from browser captures, Issue #82).
 # When this header is absent, upstream ignores slot79 and serves the account
 # default model, so model selection silently no-ops.
+# Users can override any model's 16-hex ticket via CONFIG["model_tickets"].
 MODEL_IDS = {
+    "gemini-4-hydrogen": "56fdd199312815e2",
+    "gemini-4-hydrogen-thinking": "56fdd199312815e2",
+    "gemini-hydrogen": "56fdd199312815e2",
     "gemini-3.8-flash": "56fdd199312815e2",
     "gemini-3.8-flash-thinking": "56fdd199312815e2",
     "gemini-3.7-flash": "56fdd199312815e2",
@@ -148,13 +168,20 @@ MODEL_IDS = {
 }
 
 
-def build_model_header(model_name: str, model_id: int) -> Optional[str]:
+def build_model_header(
+    model_name: str, model_id: int, model_tickets: Optional[dict] = None
+) -> Optional[str]:
     """Build the x-goog-ext-525001261-jspb model-selection header.
 
     idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
+    Checks model_tickets (or CONFIG["model_tickets"]) before MODEL_IDS.
     Returns None for models without a known internal ID (-> account default).
     """
-    mid = MODEL_IDS.get(model_name)
+    tickets = model_tickets if model_tickets is not None else (CONFIG.get("model_tickets") or {})
+    if model_name in tickets:
+        mid = tickets.get(model_name)
+    else:
+        mid = MODEL_IDS.get(model_name)
     if not mid:
         return None
     try:
@@ -472,13 +499,14 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
         text = extract_response_text(raw)
         if text:
             yield text
         return
 
     prev_text = ""
+    cleaner = StreamTextCleaner()
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, headers={"Connection": "close"}) as client:
         try:
@@ -505,12 +533,19 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                 log("Stream answer replaced mid-flight; keeping already-emitted text")
                                 continue
                             prev_text = ""  # first frame was noise; adopt the real answer
-                        delta = clean_gemini_text(current[len(prev_text):], strip=False)
+                            cleaner = StreamTextCleaner()
+                        delta = cleaner.feed(current[len(prev_text):])
                         prev_text = current
                         if delta:
                             yield delta
+            tail = cleaner.flush()
+            if tail:
+                yield tail
         except Exception as e:
             if prev_text:
+                tail = cleaner.flush()
+                if tail:
+                    yield tail
                 log(f"Stream interrupted after partial output ({len(prev_text)} chars), ending cleanly: {e}")
                 return
             # Hard upstream rejections (BardErrorInfo) - retrying is futile,
@@ -520,7 +555,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             status = getattr(getattr(e, "response", None), "status_code", 0)
             if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
                 log("BL/XSRF refreshed, falling back to non-streaming for this request")
-                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name=model_name)
                 text = extract_response_text(raw)
                 if text:
                     yield text
@@ -528,13 +563,532 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             raise
 
 
-def clean_gemini_text(text: str, strip: bool = True) -> str:
-    """Remove internal code execution artifacts."""
-    text = re.sub(
-        r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
-        '', text, flags=re.DOTALL
+_UI_TAG_NAMES = ("Steps", "Step", "ElicitationsGroup", "Elicitation", "FollowUp")
+_CARD_URL_PREFIXES = (
+    "http://googleusercontent.com/card_content/",
+    "https://googleusercontent.com/card_content/",
+)
+_CODE_EXEC_INFO_RE = re.compile(
+    r"^(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\s*$"
+)
+_CODE_EXEC_LANG_PREFIXES = ("python?code_", "javascript?code_", "text?code_")
+_ATTR_RE = re.compile(r'([A-Za-z_][\w:-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')')
+_PROSE_SPECIAL_RE = re.compile(r"[ \t\r\n<`~h]")
+_PROSE_SPECIAL_NO_UI_RE = re.compile(r"[ \t\r\n`~h]")
+_MAX_UI_TAG_LEN = 2048
+_MAX_UI_BLOCK_LEN = 32768
+
+
+def _match_ui_tag_prefix(s: str) -> str:
+    pos = 2 if s.startswith("</") else 1
+    if pos == len(s):
+        return "need_more"
+    j = pos
+    while j < len(s) and s[j].isascii() and s[j].isalpha():
+        j += 1
+    name = s[pos:j]
+    if j == len(s):
+        if name and any(t.startswith(name) for t in _UI_TAG_NAMES):
+            return "need_more"
+        return "no"
+    if name in _UI_TAG_NAMES and s[j] in (" ", "\t", "\r", "\n", ">", "/"):
+        return "match"
+    return "no"
+
+
+def _find_tag_end(s: str) -> int:
+    quote = None
+    for pos in range(1, len(s)):
+        ch = s[pos]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == ">":
+            return pos
+    return -1
+
+
+def _parse_ui_tag(tag_str: str) -> tuple:
+    inner = tag_str[1:-1].strip()
+    if inner.startswith("/"):
+        return inner[1:].strip(), True, False, {}
+    is_self_closing = inner.endswith("/")
+    if is_self_closing:
+        inner = inner[:-1].rstrip()
+    m = re.match(r"^([A-Za-z]+)(.*)$", inner, re.DOTALL)
+    name = m.group(1) if m else inner
+    attr_str = m.group(2) if m else ""
+    attrs = {
+        k: html.unescape(v1 if v1 is not None else v2)
+        for k, v1, v2 in _ATTR_RE.findall(attr_str)
+    }
+    return name, False, is_self_closing, attrs
+
+
+def _is_closing_fence(line: str, fence_char: str, fence_len: int) -> bool:
+    stripped = line.rstrip(" \t\r")
+    indent = len(stripped) - len(stripped.lstrip(" "))
+    if indent > 3:
+        return False
+    rest = stripped[indent:]
+    return len(rest) >= fence_len and all(c == fence_char for c in rest)
+
+
+def _format_elicitation_block(message: str, inner: str) -> str:
+    items = []
+    pos = 0
+    while pos < len(inner):
+        idx = inner.find("<Elicitation", pos)
+        if idx == -1:
+            break
+        after = idx + len("<Elicitation")
+        if after >= len(inner) or inner[after] not in (" ", "\t", "\r", "\n", ">", "/"):
+            pos = after
+            continue
+        end = _find_tag_end(inner[idx:])
+        if end == -1:
+            break
+        _, is_closing, _, attrs = _parse_ui_tag(inner[idx : idx + end + 1])
+        if not is_closing:
+            item = (attrs.get("label") or attrs.get("query") or "").strip()
+            if item:
+                items.append(item)
+        pos = idx + end + 1
+    lines = []
+    if message:
+        lines.append(f"**{message}**")
+    for item in items:
+        lines.append(f"- {item}")
+    if not lines:
+        return ""
+    return "---\n\n" + "\n".join(lines)
+
+
+class StreamTextCleaner:
+    """Incremental cleaner for Gemini Web code artifacts and UI XML widgets."""
+
+    def __init__(self, clean_ui_tags: bool = None, elicitation_mode: str = None):
+        if clean_ui_tags is None:
+            clean_ui_tags = CONFIG.get("clean_ui_tags", True)
+        if elicitation_mode is None:
+            elicitation_mode = CONFIG.get("elicitation_mode", "strip")
+        self.clean_ui_tags = bool(clean_ui_tags)
+        self.elicitation_mode = str(elicitation_mode or "strip").lower()
+        self._buf = ""
+        self._pending_ws = ""
+        self._skip_ws = False
+        self._need_block_sep = False
+        self._has_output = False
+        self._trailing_newlines = 0
+        self._in_code_fence = False
+        self._suppress_fence = False
+        self._fence_char = ""
+        self._fence_len = 0
+        self._fence_line_buf = ""
+        self._inline_ticks = 0
+        self._step_index = 0
+        self._block_tag = None
+        self._block_attrs = {}
+        self._block_buf = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buf += chunk
+        return self._process(final=False)
+
+    def flush(self) -> str:
+        return self._process(final=True)
+
+    def _append_out(self, out: list, text: str) -> None:
+        if not text:
+            return
+        out.append(text)
+        self._has_output = True
+        nl = 0
+        all_nl = True
+        for ch in reversed(text):
+            if ch == "\n":
+                nl += 1
+            elif ch == "\r":
+                continue
+            else:
+                all_nl = False
+                break
+        self._trailing_newlines = min(
+            2, (self._trailing_newlines + nl) if all_nl else nl
+        )
+
+    def _emit_block_sep(self, out: list) -> None:
+        if self._has_output:
+            need = 2 - self._trailing_newlines
+            if need > 0:
+                self._append_out(out, "\n" * need)
+
+    def _flush_ws_before_visible(self, out: list) -> None:
+        if self._need_block_sep:
+            self._emit_block_sep(out)
+            self._need_block_sep = False
+            self._pending_ws = ""
+            self._skip_ws = False
+        elif self._pending_ws:
+            self._append_out(out, self._pending_ws)
+            self._pending_ws = ""
+        self._skip_ws = False
+
+    def _at_fence_start(self) -> bool:
+        if self._need_block_sep:
+            return True
+        if "\n" in self._pending_ws:
+            tail = self._pending_ws.rsplit("\n", 1)[1]
+            return len(tail) <= 3 and all(c == " " for c in tail)
+        if not self._has_output or self._trailing_newlines >= 1:
+            return len(self._pending_ws) <= 3 and all(c == " " for c in self._pending_ws)
+        return False
+
+    def _finish_block(self, out: list, tag: str, attrs: dict, inner: str) -> None:
+        if self.elicitation_mode == "markdown":
+            if tag == "ElicitationsGroup":
+                md = _format_elicitation_block((attrs.get("message") or "").strip(), inner)
+            else:
+                label = (attrs.get("label") or attrs.get("query") or inner).strip()
+                md = f"- {label}" if label else ""
+            if md:
+                self._pending_ws = ""
+                self._emit_block_sep(out)
+                self._append_out(out, md)
+                self._skip_ws = True
+                self._need_block_sep = True
+                return
+        self._pending_ws = ""
+        self._skip_ws = True
+        if self._has_output:
+            self._need_block_sep = True
+
+    def _process(self, final: bool) -> str:
+        out = []
+        special_re = _PROSE_SPECIAL_RE if self.clean_ui_tags else _PROSE_SPECIAL_NO_UI_RE
+
+        while self._buf or (final and self._block_tag):
+            if self._block_tag:
+                if self._buf:
+                    self._block_buf += self._buf
+                    self._buf = ""
+                m = re.search(rf"</{self._block_tag}\s*>", self._block_buf)
+                if m:
+                    inner = self._block_buf[: m.start()]
+                    rest = self._block_buf[m.end() :]
+                    tag, attrs = self._block_tag, self._block_attrs
+                    self._block_tag = None
+                    self._block_attrs = {}
+                    self._block_buf = ""
+                    self._buf = rest
+                    self._finish_block(out, tag, attrs, inner)
+                    continue
+                if final or len(self._block_buf) > _MAX_UI_BLOCK_LEN:
+                    tag, attrs, inner = self._block_tag, self._block_attrs, self._block_buf
+                    self._block_tag = None
+                    self._block_attrs = {}
+                    self._block_buf = ""
+                    self._finish_block(out, tag, attrs, inner)
+                    continue
+                break
+
+            if self._in_code_fence:
+                nl = self._buf.find("\n")
+                if self._suppress_fence:
+                    if nl != -1:
+                        line = self._buf[:nl]
+                        self._buf = self._buf[nl + 1 :]
+                        if _is_closing_fence(line, self._fence_char, self._fence_len):
+                            self._in_code_fence = False
+                            self._suppress_fence = False
+                        continue
+                    if final:
+                        self._buf = ""
+                        self._in_code_fence = False
+                        self._suppress_fence = False
+                    break
+                if nl != -1:
+                    part = self._buf[: nl + 1]
+                    self._buf = self._buf[nl + 1 :]
+                    full_line = self._fence_line_buf + part[:-1]
+                    self._fence_line_buf = ""
+                    self._append_out(out, part)
+                    if _is_closing_fence(full_line, self._fence_char, self._fence_len):
+                        self._in_code_fence = False
+                    continue
+                chunk = self._buf
+                self._buf = ""
+                if len(self._fence_line_buf) < 64:
+                    self._fence_line_buf += chunk[: 64 - len(self._fence_line_buf)]
+                self._append_out(out, chunk)
+                if final and _is_closing_fence(
+                    self._fence_line_buf, self._fence_char, self._fence_len
+                ):
+                    self._in_code_fence = False
+                    self._fence_line_buf = ""
+                break
+
+            if self._inline_ticks > 0:
+                m = re.search(r"[`\n]", self._buf)
+                if not m:
+                    self._append_out(out, self._buf)
+                    self._buf = ""
+                    break
+                if m.start() > 0:
+                    self._append_out(out, self._buf[: m.start()])
+                    self._buf = self._buf[m.start() :]
+                    continue
+                if self._buf[0] == "\n":
+                    self._append_out(out, "\n")
+                    self._buf = self._buf[1:]
+                    if self._trailing_newlines >= 2:
+                        self._inline_ticks = 0
+                    continue
+                count = 0
+                while count < len(self._buf) and self._buf[count] == "`":
+                    count += 1
+                if count == len(self._buf) and not final:
+                    break
+                self._append_out(out, self._buf[:count])
+                self._buf = self._buf[count:]
+                if count == self._inline_ticks:
+                    self._inline_ticks = 0
+                continue
+
+            ch = self._buf[0]
+            if ch in (" ", "\t", "\r", "\n"):
+                pos = 1
+                while pos < len(self._buf) and self._buf[pos] in (" ", "\t", "\r", "\n"):
+                    pos += 1
+                ws = self._buf[:pos]
+                self._buf = self._buf[pos:]
+                if not self._skip_ws:
+                    self._pending_ws += ws
+                continue
+
+            if ch == "h":
+                if any(p.startswith(self._buf) for p in _CARD_URL_PREFIXES):
+                    if not final:
+                        break
+                else:
+                    matched_prefix = next(
+                        (p for p in _CARD_URL_PREFIXES if self._buf.startswith(p)), None
+                    )
+                    if matched_prefix:
+                        d_end = len(matched_prefix)
+                        while d_end < len(self._buf) and self._buf[d_end].isdigit():
+                            d_end += 1
+                        if d_end == len(self._buf) and not final:
+                            break
+                        if d_end > len(matched_prefix):
+                            if d_end < len(self._buf) and self._buf[d_end] == "\r":
+                                if d_end + 1 == len(self._buf) and not final:
+                                    break
+                                if d_end + 1 < len(self._buf) and self._buf[d_end + 1] == "\n":
+                                    d_end += 2
+                            elif d_end < len(self._buf) and self._buf[d_end] == "\n":
+                                d_end += 1
+                            self._buf = self._buf[d_end:]
+                            continue
+                self._flush_ws_before_visible(out)
+                self._append_out(out, "h")
+                self._buf = self._buf[1:]
+                continue
+
+            if ch in ("`", "~"):
+                count = 0
+                while count < len(self._buf) and self._buf[count] == ch:
+                    count += 1
+                if count == len(self._buf) and not final:
+                    break
+                if ch == "~":
+                    if count >= 3 and self._at_fence_start():
+                        nl = self._buf.find("\n", count)
+                        if nl == -1 and not final:
+                            break
+                        end = nl + 1 if nl != -1 else len(self._buf)
+                        self._flush_ws_before_visible(out)
+                        self._append_out(out, self._buf[:end])
+                        self._buf = self._buf[end:]
+                        self._in_code_fence = True
+                        self._suppress_fence = False
+                        self._fence_char = "~"
+                        self._fence_len = count
+                        self._fence_line_buf = ""
+                        continue
+                    self._flush_ws_before_visible(out)
+                    self._append_out(out, self._buf[:count])
+                    self._buf = self._buf[count:]
+                    continue
+                if count < 3:
+                    self._flush_ws_before_visible(out)
+                    self._append_out(out, self._buf[:count])
+                    self._buf = self._buf[count:]
+                    self._inline_ticks = count
+                    continue
+                if self._at_fence_start():
+                    nl = self._buf.find("\n", count)
+                    if nl == -1 and not final:
+                        break
+                    info = self._buf[count : nl if nl != -1 else len(self._buf)]
+                    end = nl + 1 if nl != -1 else len(self._buf)
+                    if _CODE_EXEC_INFO_RE.match(info):
+                        self._buf = self._buf[end:]
+                        self._in_code_fence = True
+                        self._suppress_fence = True
+                        self._fence_char = "`"
+                        self._fence_len = count
+                        continue
+                    self._flush_ws_before_visible(out)
+                    self._append_out(out, self._buf[:end])
+                    self._buf = self._buf[end:]
+                    self._in_code_fence = True
+                    self._suppress_fence = False
+                    self._fence_char = "`"
+                    self._fence_len = count
+                    self._fence_line_buf = ""
+                    continue
+                after = self._buf[count:]
+                if any(p.startswith(after) for p in _CODE_EXEC_LANG_PREFIXES) and not final:
+                    break
+                if any(after.startswith(p) for p in _CODE_EXEC_LANG_PREFIXES):
+                    nl = self._buf.find("\n", count)
+                    if nl == -1 and not final:
+                        break
+                    info = self._buf[count : nl if nl != -1 else len(self._buf)]
+                    if _CODE_EXEC_INFO_RE.match(info):
+                        end = nl + 1 if nl != -1 else len(self._buf)
+                        self._buf = self._buf[end:]
+                        self._in_code_fence = True
+                        self._suppress_fence = True
+                        self._fence_char = "`"
+                        self._fence_len = count
+                        continue
+                self._flush_ws_before_visible(out)
+                self._append_out(out, self._buf[:count])
+                self._buf = self._buf[count:]
+                self._inline_ticks = count
+                continue
+
+            if ch == "<" and self.clean_ui_tags:
+                status = _match_ui_tag_prefix(self._buf)
+                if status == "need_more":
+                    if not final:
+                        break
+                elif status == "match":
+                    end_pos = _find_tag_end(self._buf)
+                    if end_pos == -1:
+                        if not final and len(self._buf) <= _MAX_UI_TAG_LEN:
+                            break
+                        if (
+                            final
+                            and self.elicitation_mode == "strip"
+                            and re.match(
+                                r"^</?(?:ElicitationsGroup|Elicitation|FollowUp)\b",
+                                self._buf,
+                            )
+                        ):
+                            self._buf = ""
+                            self._pending_ws = ""
+                            self._skip_ws = True
+                            break
+                    else:
+                        tag_str = self._buf[: end_pos + 1]
+                        self._buf = self._buf[end_pos + 1 :]
+                        name, is_closing, is_self_closing, attrs = _parse_ui_tag(tag_str)
+                        if name == "Steps":
+                            self._step_index = 0
+                            self._pending_ws = ""
+                            self._skip_ws = True
+                            if self._has_output:
+                                self._need_block_sep = True
+                        elif name == "Step":
+                            if is_closing:
+                                self._pending_ws = ""
+                                self._skip_ws = True
+                                if self._has_output:
+                                    self._need_block_sep = True
+                            else:
+                                self._step_index += 1
+                                title = (attrs.get("title") or "").strip()
+                                subtitle = (attrs.get("subtitle") or "").strip()
+                                if title and subtitle:
+                                    heading = f"#### {self._step_index}. {title} — {subtitle}"
+                                elif title:
+                                    heading = f"#### {self._step_index}. {title}"
+                                elif subtitle:
+                                    heading = f"#### {self._step_index}. {subtitle}"
+                                else:
+                                    heading = f"#### Step {self._step_index}"
+                                self._pending_ws = ""
+                                self._emit_block_sep(out)
+                                self._append_out(out, heading)
+                                self._need_block_sep = True
+                                self._skip_ws = True
+                        elif name in ("ElicitationsGroup", "Elicitation", "FollowUp"):
+                            if is_closing:
+                                self._pending_ws = ""
+                                self._skip_ws = True
+                                if self._has_output:
+                                    self._need_block_sep = True
+                            elif is_self_closing:
+                                if (
+                                    self.elicitation_mode == "markdown"
+                                    and name in ("Elicitation", "FollowUp")
+                                ):
+                                    label = (attrs.get("label") or attrs.get("query") or "").strip()
+                                    if label:
+                                        self._pending_ws = ""
+                                        self._emit_block_sep(out)
+                                        self._append_out(out, f"- {label}")
+                                        self._skip_ws = True
+                                        self._need_block_sep = True
+                                    else:
+                                        self._pending_ws = ""
+                                        self._skip_ws = True
+                                else:
+                                    self._pending_ws = ""
+                                    self._skip_ws = True
+                                    if self._has_output:
+                                        self._need_block_sep = True
+                            else:
+                                self._block_tag = name
+                                self._block_attrs = attrs
+                                self._block_buf = ""
+                        continue
+                self._flush_ws_before_visible(out)
+                self._append_out(out, "<")
+                self._buf = self._buf[1:]
+                continue
+
+            m = special_re.search(self._buf, 1)
+            end = m.start() if m else len(self._buf)
+            self._flush_ws_before_visible(out)
+            self._append_out(out, self._buf[:end])
+            self._buf = self._buf[end:]
+
+        if final and self._pending_ws and not self._skip_ws:
+            self._append_out(out, self._pending_ws)
+            self._pending_ws = ""
+        return "".join(out)
+
+
+def clean_gemini_text(
+    text: str,
+    strip: bool = True,
+    clean_ui_tags: bool = None,
+    elicitation_mode: str = None,
+) -> str:
+    """Remove internal code execution artifacts and format Gemini Web UI tags."""
+    cleaner = StreamTextCleaner(
+        clean_ui_tags=clean_ui_tags, elicitation_mode=elicitation_mode
     )
-    return text.strip() if strip else text
+    result = cleaner.feed(text) + cleaner.flush()
+    return result.strip() if strip else result
 
 
 def iter_frames(line: str):
@@ -1073,10 +1627,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _resolve_model(self, model_name):
+        default = CONFIG.get("default_model")
+        if default not in MODELS:
+            default = "gemini-4-hydrogen"
+        model_name = (model_name or default).strip() if isinstance(model_name, str) else default
+        if "/" in model_name and model_name not in MODELS:
+            candidate = model_name.rsplit("/", 1)[-1]
+            if candidate.rsplit("@think=", 1)[0] in MODELS:
+                model_name = candidate
         think_override = None
         if "@think=" in model_name:
             model_name, think_str = model_name.rsplit("@think=", 1)
-            think_override = int(think_str)
+            try:
+                think_override = int(think_str)
+            except ValueError:
+                return None, None, None, f"Invalid think level: {think_str}", None
         cfg = MODELS.get(model_name)
         if not cfg:
             return None, None, None, f"Unknown model: {model_name}", None

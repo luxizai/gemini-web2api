@@ -13,7 +13,8 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
+- **Multiple Models**: Gemini 4 Hydrogen (free tier), Flash (3.8/3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
+- **Clean Markdown Output**: Automatically converts Gemini Web `<Steps>`/`<Step>` UI tags to Markdown and strips `<ElicitationsGroup>`/`<FollowUp>` chips (streaming-safe)
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
 - **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
@@ -88,7 +89,10 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.8-flash` | Workhorse model, best reasoning & coding (latest) | ~12k chars |
+| `gemini-4-hydrogen` | Gemini 4 Hydrogen — fast workhorse model (free tier, default) | ~12k chars |
+| `gemini-4-hydrogen-thinking` | Gemini 4 Hydrogen with deep thinking enabled | **~20k chars** |
+| `gemini-hydrogen` | Alias for `gemini-4-hydrogen` | ~12k chars |
+| `gemini-3.8-flash` | Workhorse model, strong reasoning & coding | ~12k chars |
 | `gemini-3.8-flash-thinking` | Extended thinking on latest Flash backend | **~20k chars** |
 | `gemini-3.7-flash` | All-around model | ~12k chars |
 | `gemini-3.6-flash` | All-around model | ~12k chars |
@@ -185,12 +189,19 @@ Create `config.json` in the same directory:
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "model_tickets": {},
+  "clean_ui_tags": true,
+  "elicitation_mode": "strip"
 }
 ```
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
+
+- `model_tickets`: Optional map of `model_name -> 16-hex ticket` overrides for the `x-goog-ext-525001261-jspb` routing header (useful if Google rotates a model's ticket ID on `gemini.google.com`).
+- `clean_ui_tags`: When `true` (default), converts Gemini Web `<Steps>`/`<Step>` tags into clean Markdown headings and filters `<ElicitationsGroup>`/`<FollowUp>` widgets without affecting code blocks.
+- `elicitation_mode`: `"strip"` (default) removes follow-up chip tags; `"markdown"` converts them into a trailing Markdown bullet list.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 

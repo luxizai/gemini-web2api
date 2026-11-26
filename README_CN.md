@@ -13,7 +13,8 @@
 - **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
-- **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
+- **多模型**: Gemini 4 Hydrogen (免费档), Flash (3.8/3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
+- **干净 Markdown 输出**: 自动将 Gemini 网页端 `<Steps>`/`<Step>` 组件转为标准 Markdown，并清理 `<ElicitationsGroup>`/`<FollowUp>` 追问标签（兼容流式输出）
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
 - **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
@@ -78,7 +79,10 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.8-flash` | 主力模型, 最强推理与代码 (最新) | ~1.2万字 |
+| `gemini-4-hydrogen` | Gemini 4 Hydrogen 主力模型 (免费档，默认) | ~1.2万字 |
+| `gemini-4-hydrogen-thinking` | Gemini 4 Hydrogen 深度思考模式 | **~2万字** |
+| `gemini-hydrogen` | `gemini-4-hydrogen` 别名 | ~1.2万字 |
+| `gemini-3.8-flash` | 主力模型, 强推理与代码 | ~1.2万字 |
 | `gemini-3.8-flash-thinking` | 最新 Flash 后端的扩展思考 | **~2万字** |
 | `gemini-3.7-flash` | 全能模型 | ~1.2万字 |
 | `gemini-3.6-flash` | 全能模型 | ~1.2万字 |
@@ -175,12 +179,19 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "model_tickets": {},
+  "clean_ui_tags": true,
+  "elicitation_mode": "strip"
 }
 ```
 
 将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
 不会将对话保存在账号历史记录中。
+
+- `model_tickets`：可选的模型票据覆盖表（`模型名 -> 16位 hex ticket`），用于自定义 `x-goog-ext-525001261-jspb` 请求头（当网页端更换模型 ticket 时无需改代码）。
+- `clean_ui_tags`：默认 `true`，自动将 Gemini 网页端透出的 `<Steps>`/`<Step>` 标签转为标准 Markdown 标题，并处理 `<ElicitationsGroup>`/`<FollowUp>` 追问标签，同时保护代码块内容不被误改。
+- `elicitation_mode`：`"strip"`（默认）直接移除底部追问气泡；`"markdown"` 转为文末 Markdown 列表。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 
