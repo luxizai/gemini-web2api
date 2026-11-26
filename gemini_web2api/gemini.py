@@ -238,6 +238,39 @@ _CARD_URL_PREFIXES = (
     "http://googleusercontent.com/card_content/",
     "https://googleusercontent.com/card_content/",
 )
+_IMMERSIVE_CHIP_PREFIXES = (
+    "http://googleusercontent.com/immersive_entry_chip/",
+    "https://googleusercontent.com/immersive_entry_chip/",
+)
+_IMMERSIVE_CHIP_RE = re.compile(
+    r"[ \t]*(?:\r?\n)*https?://googleusercontent\.com/immersive_entry_chip/(\d+)[ \t]*(?:\r?\n)*"
+)
+_STRIPPABLE_URL_PREFIXES = _CARD_URL_PREFIXES + _IMMERSIVE_CHIP_PREFIXES
+_NO_CANVAS_HINT = (
+    "[Formatting preference]: Output any code, HTML, SVG, or documents "
+    "directly in your reply using standard Markdown fenced code blocks. "
+    "Do not use Canvas or immersive document widgets."
+)
+_CODE_EXT_TO_LANG = {
+    "html": "html", "htm": "html", "svg": "svg", "xml": "xml",
+    "js": "javascript", "mjs": "javascript", "cjs": "javascript", "jsx": "jsx",
+    "ts": "typescript", "tsx": "tsx", "py": "python", "css": "css",
+    "scss": "scss", "less": "less", "json": "json", "sh": "bash",
+    "bash": "bash", "ps1": "powershell", "sql": "sql", "go": "go",
+    "rs": "rust", "java": "java", "kt": "kotlin", "c": "c",
+    "cpp": "cpp", "cc": "cpp", "h": "c", "hpp": "cpp", "cs": "csharp",
+    "rb": "ruby", "php": "php", "swift": "swift", "yaml": "yaml",
+    "yml": "yaml", "toml": "toml", "md": "markdown", "txt": "text",
+}
+_INTERNAL_ID_RE = re.compile(
+    r"^(?:(?:c|r|rc)_[0-9a-zA-Z_.-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|/contrib_service/.*)$"
+)
+_CODE_CONTENT_RE = re.compile(
+    r"^\s*(?:<!doctype\s+html|<html\b|<svg\b|<\?xml\b|import\s+\w|from\s+\w+\s+import\b|"
+    r"def\s+\w+\s*\(|function\s+\w*\s*\(|(?:const|let|var)\s+\w+|class\s+\w+|"
+    r"#include\s*<|package\s+\w+|#!/usr/bin/)",
+    re.IGNORECASE,
+)
 _CODE_EXEC_INFO_RE = re.compile(
     r"^(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\s*$"
 )
@@ -247,6 +280,169 @@ _PROSE_SPECIAL_RE = re.compile(r"[ \t\r\n<`~h]")
 _PROSE_SPECIAL_NO_UI_RE = re.compile(r"[ \t\r\n`~h]")
 _MAX_UI_TAG_LEN = 2048
 _MAX_UI_BLOCK_LEN = 32768
+
+
+def _prepare_prompt(prompt: str) -> str:
+    """Optionally prepend a lightweight formatting hint to avoid Canvas chips."""
+    if not prompt or not CONFIG.get("disable_canvas", True):
+        return prompt
+    lower = prompt.lower()
+    if "do not use canvas" in lower or "immersive document" in lower:
+        return prompt
+    return f"{_NO_CANVAS_HINT}\n\n{prompt}"
+
+
+def _infer_lang_from_hint(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"\.([a-zA-Z0-9]{1,8})$", text.strip())
+    if m:
+        return _CODE_EXT_TO_LANG.get(m.group(1).lower(), "")
+    return ""
+
+
+def _infer_lang_from_content(content: str) -> str:
+    s = content.lstrip().lower()
+    if s.startswith("<!doctype html") or s.startswith("<html"):
+        return "html"
+    if s.startswith("<svg"):
+        return "svg"
+    if s.startswith("<?xml"):
+        return "xml"
+    return ""
+
+
+def _collect_entry_strings(node, out: list, depth: int = 0) -> None:
+    if depth > 3:
+        return
+    if isinstance(node, str):
+        if node.strip():
+            out.append(node)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_entry_strings(item, out, depth + 1)
+
+
+def _parse_canvas_entry(entry: list) -> Optional[dict]:
+    if not isinstance(entry, list) or not entry:
+        return None
+    kind = entry[10] if len(entry) > 10 and entry[10] in (1, 2) else None
+    lang = ""
+    if len(entry) > 14 and isinstance(entry[14], list):
+        details = entry[14]
+        candidates = (
+            (details[1] if len(details) > 1 else None, details[4] if len(details) > 4 else None)
+            if kind != 1
+            else (details[4] if len(details) > 4 else None, details[1] if len(details) > 1 else None)
+        )
+        for cand_lang in candidates:
+            if isinstance(cand_lang, str) and re.match(r"^[a-zA-Z0-9_+#.-]{1,24}$", cand_lang.strip()):
+                lang = cand_lang.strip().lower()
+                break
+
+    raw_strings = []
+    for idx, item in enumerate(entry):
+        if idx == 14:
+            continue
+        _collect_entry_strings(item, raw_strings, 0)
+
+    ext_hint = ""
+    filtered = []
+    for s in raw_strings:
+        stripped = s.strip()
+        if not stripped:
+            continue
+        if not ext_hint:
+            ext_hint = _infer_lang_from_hint(stripped)
+        if stripped.startswith(("http://", "https://")) or _INTERNAL_ID_RE.match(stripped):
+            continue
+        if lang and stripped.lower() == lang:
+            continue
+        filtered.append(s)
+
+    if not filtered:
+        return None
+    content = max(filtered, key=len)
+    if len(content.strip()) < 20 and "\n" not in content and not _CODE_CONTENT_RE.match(content):
+        return None
+
+    title = ""
+    for s in filtered:
+        if s == content:
+            continue
+        st = s.strip()
+        if st and "\n" not in st and len(st) <= 200:
+            title = st
+            break
+
+    if not lang:
+        lang = _infer_lang_from_hint(title) or ext_hint or _infer_lang_from_content(content)
+
+    return {"title": title, "lang": lang, "kind": kind, "content": content}
+
+
+def _iter_canvas_node_entries(node, out: list, depth: int = 0) -> None:
+    if depth > 4 or not isinstance(node, list) or not node:
+        return
+    # Detect whether this list itself represents a single canvas entry.
+    direct_str = any(isinstance(x, str) and len(x.strip()) > 0 for x in node[:6])
+    has_kind = len(node) > 10 and node[10] in (1, 2)
+    if direct_str or has_kind:
+        parsed = _parse_canvas_entry(node)
+        if parsed:
+            out.append(parsed)
+            return
+    for child in node:
+        if isinstance(child, list):
+            _iter_canvas_node_entries(child, out, depth + 1)
+
+
+def _extract_canvas_entries(cand: list) -> list:
+    """Extract Gemini Canvas / Immersive Document entries from candidate[30]."""
+    if not isinstance(cand, list) or len(cand) <= 30 or not isinstance(cand[30], list):
+        return []
+    entries = []
+    _iter_canvas_node_entries(cand[30], entries, 0)
+    return entries
+
+
+def _format_canvas_entry(entry: dict) -> str:
+    content = (entry.get("content") or "").strip("\r\n")
+    if not content:
+        return ""
+    title = (entry.get("title") or "").strip()
+    lang = (entry.get("lang") or "").strip()
+    kind = entry.get("kind")
+    is_code = (
+        kind == 2
+        or (bool(lang) and lang.lower() not in ("markdown", "md", "text", "txt", "zh", "en"))
+        or bool(_CODE_CONTENT_RE.match(content))
+    )
+    if is_code:
+        runs = re.findall(r"`+", content)
+        fence = "`" * max(3, (max((len(r) for r in runs), default=0) + 1))
+        header = f"**{title}**\n\n" if title else ""
+        return f"{header}{fence}{lang}\n{content}\n{fence}"
+    if title and not content.lstrip().startswith("#"):
+        return f"### {title}\n\n{content}"
+    return content
+
+
+def _inline_canvas_chips(text: str, canvas_map: dict) -> str:
+    """Replace http://googleusercontent.com/immersive_entry_chip/N placeholders."""
+    if not text or "immersive_entry_chip/" not in text:
+        return text
+
+    def _repl(m):
+        idx = int(m.group(1))
+        entry = canvas_map.get(idx)
+        if entry:
+            formatted = _format_canvas_entry(entry)
+            if formatted:
+                return f"\n\n{formatted}\n\n"
+        return ""
+
+    return _IMMERSIVE_CHIP_RE.sub(_repl, text)
 
 
 def _match_ui_tag_prefix(s: str) -> str:
@@ -373,6 +569,7 @@ class StreamTextCleaner:
         self._block_tag = None
         self._block_attrs = {}
         self._block_buf = ""
+        self.seen_chip_indices = []
 
     def feed(self, chunk: str) -> str:
         if not chunk:
@@ -556,12 +753,12 @@ class StreamTextCleaner:
                 continue
 
             if ch == "h":
-                if any(p.startswith(self._buf) for p in _CARD_URL_PREFIXES):
+                if any(p.startswith(self._buf) for p in _STRIPPABLE_URL_PREFIXES):
                     if not final:
                         break
                 else:
                     matched_prefix = next(
-                        (p for p in _CARD_URL_PREFIXES if self._buf.startswith(p)), None
+                        (p for p in _STRIPPABLE_URL_PREFIXES if self._buf.startswith(p)), None
                     )
                     if matched_prefix:
                         d_end = len(matched_prefix)
@@ -570,6 +767,10 @@ class StreamTextCleaner:
                         if d_end == len(self._buf) and not final:
                             break
                         if d_end > len(matched_prefix):
+                            if matched_prefix in _IMMERSIVE_CHIP_PREFIXES:
+                                chip_idx = int(self._buf[len(matched_prefix):d_end])
+                                if chip_idx not in self.seen_chip_indices:
+                                    self.seen_chip_indices.append(chip_idx)
                             if d_end < len(self._buf) and self._buf[d_end] == "\r":
                                 if d_end + 1 == len(self._buf) and not final:
                                     break
@@ -578,6 +779,11 @@ class StreamTextCleaner:
                             elif d_end < len(self._buf) and self._buf[d_end] == "\n":
                                 d_end += 1
                             self._buf = self._buf[d_end:]
+                            if matched_prefix in _IMMERSIVE_CHIP_PREFIXES:
+                                self._pending_ws = ""
+                                self._skip_ws = True
+                                if self._has_output:
+                                    self._need_block_sep = True
                             continue
                 self._flush_ws_before_visible(out)
                 self._append_out(out, "h")
@@ -845,16 +1051,36 @@ def _is_answer_frame(inner: list) -> bool:
     return False
 
 
-def _best_main_answer(line: str):
-    """Best primary-candidate answer text found in one line, or None."""
+def _merge_canvas_entries(canvas_map: dict, entries: list) -> None:
+    """Keep the longest/latest content per canvas chip index."""
+    for idx, entry in enumerate(entries):
+        prev = canvas_map.get(idx)
+        if not prev or len(entry.get("content", "")) >= len(prev.get("content", "")):
+            canvas_map[idx] = entry
+
+
+def _best_main_answer_with_canvas(line: str) -> tuple:
+    """Return (best_text_or_None, canvas_entries_list) for the primary answer frame."""
     best = ""
+    canvas_entries = []
     for inner in _iter_frames(line):
         if not _is_answer_frame(inner):
             continue
+        if isinstance(inner[4], list) and inner[4]:
+            cand0 = inner[4][0]
+            entries = _extract_canvas_entries(cand0)
+            if entries:
+                canvas_entries = entries
         for idx, text in _candidate_texts(inner):
             if idx == 0 and len(text) > len(best):
                 best = text
-    return best or None
+    return (best or None), canvas_entries
+
+
+def _best_main_answer(line: str):
+    """Best primary-candidate answer text found in one line, or None."""
+    best, _ = _best_main_answer_with_canvas(line)
+    return best
 
 
 def extract_response_text(raw: str) -> str:
@@ -872,6 +1098,7 @@ def extract_response_text(raw: str) -> str:
     if bard_err:
         code = int(bard_err.group(1))
         hints = {
+            1003: "request rejected by upstream (e.g. image attachments require a logged-in Google cookie)",
             1060: "IP temporarily blocked or region not supported - use a proxy/different network or wait",
             1037: "usage limit exceeded",
             1013: "temporary upstream error, retry later",
@@ -880,29 +1107,48 @@ def extract_response_text(raw: str) -> str:
         raise RuntimeError(f"Gemini upstream error [{code}]: {hints.get(code, 'upstream rejected request')}")
     main_best = ""
     any_best = ""
+    main_canvas = {}
+    any_canvas = {}
     for line in raw.split("\n"):
         for inner in _iter_frames(line):
             cands = _candidate_texts(inner)
+            is_main = _is_answer_frame(inner)
+            if isinstance(inner[4], list) and inner[4]:
+                entries = _extract_canvas_entries(inner[4][0])
+                if entries:
+                    _merge_canvas_entries(any_canvas, entries)
+                    if is_main:
+                        _merge_canvas_entries(main_canvas, entries)
             if not cands:
                 continue
-            is_main = _is_answer_frame(inner)
             for idx, text in cands:
                 if len(text) > len(any_best):
                     any_best = text
                 if is_main and idx == 0 and len(text) > len(main_best):
                     main_best = text
-    return clean_text(main_best or any_best)
+    chosen = main_best or any_best
+    canvas_map = main_canvas if main_best else any_canvas
+    if canvas_map:
+        if "immersive_entry_chip/" in chosen:
+            chosen = _inline_canvas_chips(chosen, canvas_map)
+        elif not chosen:
+            chosen = "\n\n".join(
+                block for block in (_format_canvas_entry(canvas_map[k]) for k in sorted(canvas_map))
+                if block
+            )
+    return clean_text(chosen)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, model_name: str = None) -> str:
     """Non-streaming generation with retry."""
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    effective_prompt = _prepare_prompt(prompt)
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+            body = _build_payload(effective_prompt, model_id, think_mode, file_refs, extra_fields).encode()
             headers = _build_headers(model_name=model_name, model_id=model_id)
             req = urllib.request.Request(_get_url(), data=body, headers=headers, method="POST")
             if proxy:
@@ -950,15 +1196,17 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     client = _get_httpx_client()
+    effective_prompt = _prepare_prompt(prompt)
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         emitted_raw_text = ""
         emitted_any = False
         raw_lines = []
+        canvas_map = {}
         cleaner = StreamTextCleaner()
         try:
-            body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+            body = _build_payload(effective_prompt, model_id, think_mode, file_refs, extra_fields)
             headers = _build_headers(model_name=model_name, model_id=model_id)
             with client.stream("POST", _get_url(), content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -974,7 +1222,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         raw_lines.append(line)
-                        current = _best_main_answer(line)
+                        current, entries = _best_main_answer_with_canvas(line)
+                        if entries:
+                            _merge_canvas_entries(canvas_map, entries)
                         if not current:
                             continue
                         if current == emitted_raw_text or emitted_raw_text.startswith(current):
@@ -994,6 +1244,18 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             if tail:
                 emitted_any = True
                 yield tail
+            if canvas_map:
+                order = [i for i in cleaner.seen_chip_indices if i in canvas_map]
+                for k in sorted(canvas_map):
+                    if k not in order:
+                        order.append(k)
+                blocks = [
+                    b for b in (_format_canvas_entry(canvas_map[k]) for k in order) if b
+                ]
+                if blocks:
+                    sep = "\n" * max(0, 2 - cleaner._trailing_newlines) if emitted_any else ""
+                    emitted_any = True
+                    yield sep + "\n\n".join(blocks)
             if emitted_any:
                 return
             # Strict parser matched nothing (protocol drift): rescan the full

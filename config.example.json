@@ -17,5 +17,6 @@
   "temporary_chats": false,
   "model_tickets": {},
   "clean_ui_tags": true,
-  "elicitation_mode": "strip"
+  "elicitation_mode": "strip",
+  "disable_canvas": true
 }

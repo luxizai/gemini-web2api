@@ -182,7 +182,8 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "temporary_chats": false,
   "model_tickets": {},
   "clean_ui_tags": true,
-  "elicitation_mode": "strip"
+  "elicitation_mode": "strip",
+  "disable_canvas": true
 }
 ```
 
@@ -192,6 +193,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 - `model_tickets`：可选的模型票据覆盖表（`模型名 -> 16位 hex ticket`），用于自定义 `x-goog-ext-525001261-jspb` 请求头（当网页端更换模型 ticket 时无需改代码）。
 - `clean_ui_tags`：默认 `true`，自动将 Gemini 网页端透出的 `<Steps>`/`<Step>` 标签转为标准 Markdown 标题，并处理 `<ElicitationsGroup>`/`<FollowUp>` 追问标签，同时保护代码块内容不被误改。
 - `elicitation_mode`：`"strip"`（默认）直接移除底部追问气泡；`"markdown"` 转为文末 Markdown 列表。
+- `disable_canvas`：默认 `true`，引导 Gemini 直接以标准 Markdown 代码块输出 HTML/SVG/代码，避免触发网页 Canvas 模式导致返回 `immersive_entry_chip/0` 链接；若上游仍触发 Canvas，也会自动从响应帧 `candidate[30]` 提取完整源码并内联替换。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 

@@ -45,6 +45,7 @@ const {
   buildModelHeader,
   cleanGeminiText,
   createStreamTextCleaner,
+  preparePrompt,
 } = sandbox;
 
 // ─── wire-format builders (mirror the Python tests) ─────────────────────────
@@ -187,6 +188,23 @@ const codeBlockSample = '```jsx\n<Steps><Step title="Demo">keep</Step></Steps>\n
 const codeCleaned = cleanGeminiText(codeBlockSample);
 check('worker preserves tags inside fenced code block', codeCleaned.includes('<Step title="Demo">keep</Step>'), true);
 check('worker converts tags outside fenced code block', codeCleaned.includes('#### 1. Real\n\nok'), true);
+
+// 13. Canvas disable_canvas prompt hint & immersive_entry_chip extraction
+check('worker preparePrompt adds no-canvas hint by default', preparePrompt('生成一个H5', { disableCanvas: true }).includes('Do not use Canvas'), true);
+check('worker preparePrompt respects disableCanvas=false', preparePrompt('生成一个H5', { disableCanvas: false }), '生成一个H5');
+
+const canvasEntry = new Array(15).fill(null);
+canvasEntry[0] = 'c_1_pelican.html';
+canvasEntry[1] = '鹈鹕骑自行车';
+canvasEntry[2] = '<!DOCTYPE html>\n<html><body><svg/></body></html>';
+canvasEntry[10] = 2;
+canvasEntry[14] = [null, 'html', null, null, null];
+const canvasInner = answerInner(['介绍。\n\nhttp://googleusercontent.com/immersive_entry_chip/0\n\n结尾。']);
+while (canvasInner[4][0].length <= 30) canvasInner[4][0].push(null);
+canvasInner[4][0][30] = [canvasEntry];
+const canvasOut = extractResponseText(makeRaw(makeLine(canvasInner)));
+check('worker strips immersive_entry_chip URL', canvasOut.includes('immersive_entry_chip'), false);
+check('worker inlines Canvas HTML code block', canvasOut.includes('**鹈鹕骑自行车**\n\n```html\n<!DOCTYPE html>\n<html><body><svg/></body></html>\n```'), true);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

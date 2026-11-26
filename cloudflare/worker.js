@@ -205,11 +205,13 @@ var DEFAULT_CONFIG = {
   // 例如: {"gemini-4-hydrogen": "56fdd199312815e2"}
   modelTickets: {},
 
-  // ---- Gemini 网页 UI 标签清洗 ----
+  // ---- Gemini 网页 UI 标签与 Canvas 处理 ----
   // 将 <Steps>/<Step> 转为标准 Markdown 标题，并处理 <ElicitationsGroup>/<FollowUp>
   cleanUiTags: true,
   // 'strip' = 移除追问气泡（推荐，默认）；'markdown' = 转为文末建议列表
   elicitationMode: 'strip',
+  // true = 引导 Gemini 直接输出内联 Markdown 代码块，避免触发 Canvas (immersive_entry_chip)
+  disableCanvas: true,
 
   // ---- API 密钥白名单 ----
   // 用于验证客户端请求的密钥列表
@@ -621,6 +623,7 @@ function getRequestConfig(env) {
     modelTickets: {},
     cleanUiTags: DEFAULT_CONFIG.cleanUiTags,
     elicitationMode: DEFAULT_CONFIG.elicitationMode,
+    disableCanvas: DEFAULT_CONFIG.disableCanvas,
     apiKeys: DEFAULT_CONFIG.apiKeys,
     cookieString: DEFAULT_CONFIG.cookieString,
     sapisid: DEFAULT_CONFIG.sapisid,
@@ -666,6 +669,10 @@ function getRequestConfig(env) {
   }
   if (env.ELICITATION_MODE) {
     config.elicitationMode = String(env.ELICITATION_MODE).trim().toLowerCase();
+  }
+  if (env.DISABLE_CANVAS !== undefined) {
+    var dc = String(env.DISABLE_CANVAS).trim().toLowerCase();
+    config.disableCanvas = !(dc === 'false' || dc === '0' || dc === 'no');
   }
 
   // ---- 认证相关字段：使用 || 操作符确保显式覆盖 ----
@@ -1267,7 +1274,8 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config, modelNam
   }
 
   // 构建请求负载、请求头、请求 URL
-  var body = buildPayload(prompt, modelId, thinkMode, config);
+  var effectivePrompt = preparePrompt(prompt, config);
+  var body = buildPayload(effectivePrompt, modelId, thinkMode, config);
   var headers = await buildHeaders(config, modelName, modelId);
   var url = buildUrl(config);
 
@@ -1398,12 +1406,208 @@ var CARD_URL_PREFIXES = [
   'http://googleusercontent.com/card_content/',
   'https://googleusercontent.com/card_content/',
 ];
+var IMMERSIVE_CHIP_PREFIXES = [
+  'http://googleusercontent.com/immersive_entry_chip/',
+  'https://googleusercontent.com/immersive_entry_chip/',
+];
+var STRIPPABLE_URL_PREFIXES = CARD_URL_PREFIXES.concat(IMMERSIVE_CHIP_PREFIXES);
+var IMMERSIVE_CHIP_RE = /[ \t]*(?:\r?\n)*https?:\/\/googleusercontent\.com\/immersive_entry_chip\/(\d+)[ \t]*(?:\r?\n)*/g;
+var NO_CANVAS_HINT =
+  '[Formatting preference]: Output any code, HTML, SVG, or documents ' +
+  'directly in your reply using standard Markdown fenced code blocks. ' +
+  'Do not use Canvas or immersive document widgets.';
+var CODE_EXT_TO_LANG = {
+  html: 'html', htm: 'html', svg: 'svg', xml: 'xml',
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'jsx',
+  ts: 'typescript', tsx: 'tsx', py: 'python', css: 'css',
+  scss: 'scss', less: 'less', json: 'json', sh: 'bash',
+  bash: 'bash', ps1: 'powershell', sql: 'sql', go: 'go',
+  rs: 'rust', java: 'java', kt: 'kotlin', c: 'c',
+  cpp: 'cpp', cc: 'cpp', h: 'c', hpp: 'cpp', cs: 'csharp',
+  rb: 'ruby', php: 'php', swift: 'swift', yaml: 'yaml',
+  yml: 'yaml', toml: 'toml', md: 'markdown', txt: 'text',
+};
+var INTERNAL_ID_RE = /^(?:(?:c|r|rc)_[0-9a-zA-Z_.-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\/contrib_service\/.*)$/;
+var CODE_CONTENT_RE = /^\s*(?:<!doctype\s+html|<html\b|<svg\b|<\?xml\b|import\s+\w|from\s+\w+\s+import\b|def\s+\w+\s*\(|function\s+\w*\s*\(|(?:const|let|var)\s+\w+|class\s+\w+|#include\s*<|package\s+\w+|#!\/usr\/bin\/)/i;
 var CODE_EXEC_INFO_RE = /^(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\s*$/;
 var CODE_EXEC_LANG_PREFIXES = ['python?code_', 'javascript?code_', 'text?code_'];
 var PROSE_SPECIAL_RE = /[ \t\r\n<`~h]/;
 var PROSE_SPECIAL_NO_UI_RE = /[ \t\r\n`~h]/;
 var MAX_UI_TAG_LEN = 2048;
 var MAX_UI_BLOCK_LEN = 32768;
+
+function preparePrompt(prompt, config) {
+  if (!prompt || (config && config.disableCanvas === false)) return prompt;
+  var lower = String(prompt).toLowerCase();
+  if (lower.indexOf('do not use canvas') !== -1 || lower.indexOf('immersive document') !== -1) {
+    return prompt;
+  }
+  return NO_CANVAS_HINT + '\n\n' + prompt;
+}
+
+function inferLangFromHint(text) {
+  if (!text) return '';
+  var m = String(text).trim().match(/\.([a-zA-Z0-9]{1,8})$/);
+  return m ? (CODE_EXT_TO_LANG[m[1].toLowerCase()] || '') : '';
+}
+
+function inferLangFromContent(content) {
+  var s = String(content || '').replace(/^\s+/, '').toLowerCase();
+  if (s.indexOf('<!doctype html') === 0 || s.indexOf('<html') === 0) return 'html';
+  if (s.indexOf('<svg') === 0) return 'svg';
+  if (s.indexOf('<?xml') === 0) return 'xml';
+  return '';
+}
+
+function collectEntryStrings(node, out, depth) {
+  if (depth > 3) return;
+  if (typeof node === 'string') {
+    if (node.trim()) out.push(node);
+  } else if (Array.isArray(node)) {
+    for (var i = 0; i < node.length; i++) {
+      collectEntryStrings(node[i], out, depth + 1);
+    }
+  }
+}
+
+function parseCanvasEntry(entry) {
+  if (!Array.isArray(entry) || entry.length === 0) return null;
+  var kind = (entry.length > 10 && (entry[10] === 1 || entry[10] === 2)) ? entry[10] : null;
+  var lang = '';
+  if (entry.length > 14 && Array.isArray(entry[14])) {
+    var details = entry[14];
+    var cands = kind !== 1
+      ? [details.length > 1 ? details[1] : null, details.length > 4 ? details[4] : null]
+      : [details.length > 4 ? details[4] : null, details.length > 1 ? details[1] : null];
+    for (var ci = 0; ci < cands.length; ci++) {
+      if (typeof cands[ci] === 'string' && /^[a-zA-Z0-9_+#.-]{1,24}$/.test(cands[ci].trim())) {
+        lang = cands[ci].trim().toLowerCase();
+        break;
+      }
+    }
+  }
+
+  var rawStrings = [];
+  for (var i = 0; i < entry.length; i++) {
+    if (i === 14) continue;
+    collectEntryStrings(entry[i], rawStrings, 0);
+  }
+
+  var extHint = '';
+  var filtered = [];
+  for (var j = 0; j < rawStrings.length; j++) {
+    var s = rawStrings[j];
+    var st = s.trim();
+    if (!st) continue;
+    if (!extHint) extHint = inferLangFromHint(st);
+    if (st.indexOf('http://') === 0 || st.indexOf('https://') === 0 || INTERNAL_ID_RE.test(st)) continue;
+    if (lang && st.toLowerCase() === lang) continue;
+    filtered.push(s);
+  }
+  if (filtered.length === 0) return null;
+
+  var content = filtered[0];
+  for (var k = 1; k < filtered.length; k++) {
+    if (filtered[k].length > content.length) content = filtered[k];
+  }
+  if (content.trim().length < 20 && content.indexOf('\n') === -1 && !CODE_CONTENT_RE.test(content)) {
+    return null;
+  }
+
+  var title = '';
+  for (var t = 0; t < filtered.length; t++) {
+    if (filtered[t] === content) continue;
+    var ts = filtered[t].trim();
+    if (ts && ts.indexOf('\n') === -1 && ts.length <= 200) {
+      title = ts;
+      break;
+    }
+  }
+  if (!lang) {
+    lang = inferLangFromHint(title) || extHint || inferLangFromContent(content);
+  }
+  return { title: title, lang: lang, kind: kind, content: content };
+}
+
+function iterCanvasNodeEntries(node, out, depth) {
+  if (depth > 4 || !Array.isArray(node) || node.length === 0) return;
+  var directStr = false;
+  var limit = Math.min(6, node.length);
+  for (var i = 0; i < limit; i++) {
+    if (typeof node[i] === 'string' && node[i].trim().length > 0) {
+      directStr = true;
+      break;
+    }
+  }
+  var hasKind = node.length > 10 && (node[10] === 1 || node[10] === 2);
+  if (directStr || hasKind) {
+    var parsed = parseCanvasEntry(node);
+    if (parsed) {
+      out.push(parsed);
+      return;
+    }
+  }
+  for (var j = 0; j < node.length; j++) {
+    if (Array.isArray(node[j])) {
+      iterCanvasNodeEntries(node[j], out, depth + 1);
+    }
+  }
+}
+
+function extractCanvasEntries(cand) {
+  if (!Array.isArray(cand) || cand.length <= 30 || !Array.isArray(cand[30])) return [];
+  var entries = [];
+  iterCanvasNodeEntries(cand[30], entries, 0);
+  return entries;
+}
+
+function mergeCanvasEntries(canvasMap, entries) {
+  for (var i = 0; i < entries.length; i++) {
+    var prev = canvasMap[i];
+    if (!prev || (entries[i].content || '').length >= (prev.content || '').length) {
+      canvasMap[i] = entries[i];
+    }
+  }
+}
+
+function formatCanvasEntry(entry) {
+  var content = String((entry && entry.content) || '').replace(/^[\r\n]+|[\r\n]+$/g, '');
+  if (!content) return '';
+  var title = String((entry && entry.title) || '').trim();
+  var lang = String((entry && entry.lang) || '').trim();
+  var kind = entry && entry.kind;
+  var lowLang = lang.toLowerCase();
+  var isCode =
+    kind === 2 ||
+    (lang.length > 0 && lowLang !== 'markdown' && lowLang !== 'md' && lowLang !== 'text' && lowLang !== 'txt' && lowLang !== 'zh' && lowLang !== 'en') ||
+    CODE_CONTENT_RE.test(content);
+  if (isCode) {
+    var runs = content.match(/`+/g) || [];
+    var maxTicks = 0;
+    for (var i = 0; i < runs.length; i++) {
+      if (runs[i].length > maxTicks) maxTicks = runs[i].length;
+    }
+    var fence = '`'.repeat(Math.max(3, maxTicks + 1));
+    var header = title ? '**' + title + '**\n\n' : '';
+    return header + fence + lang + '\n' + content + '\n' + fence;
+  }
+  if (title && content.replace(/^\s+/, '').charAt(0) !== '#') {
+    return '### ' + title + '\n\n' + content;
+  }
+  return content;
+}
+
+function inlineCanvasChips(text, canvasMap) {
+  if (!text || text.indexOf('immersive_entry_chip/') === -1) return text;
+  return text.replace(IMMERSIVE_CHIP_RE, function (_, idxStr) {
+    var entry = canvasMap[parseInt(idxStr, 10)];
+    if (entry) {
+      var formatted = formatCanvasEntry(entry);
+      if (formatted) return '\n\n' + formatted + '\n\n';
+    }
+    return '';
+  });
+}
 
 function unescapeHtmlEntities(str) {
   return String(str || '')
@@ -1548,6 +1752,7 @@ function createStreamTextCleaner(options) {
   var blockTag = null;
   var blockAttrs = {};
   var blockBuf = '';
+  var seenChipIndices = [];
 
   function appendOut(out, text) {
     if (!text) return;
@@ -1744,8 +1949,8 @@ function createStreamTextCleaner(options) {
       if (ch === 'h') {
         var isCardPartial = false;
         var matchedCardPrefix = null;
-        for (var ci = 0; ci < CARD_URL_PREFIXES.length; ci++) {
-          var cp = CARD_URL_PREFIXES[ci];
+        for (var ci = 0; ci < STRIPPABLE_URL_PREFIXES.length; ci++) {
+          var cp = STRIPPABLE_URL_PREFIXES[ci];
           if (cp.indexOf(buf) === 0) { isCardPartial = true; break; }
           if (buf.indexOf(cp) === 0) { matchedCardPrefix = cp; break; }
         }
@@ -1757,6 +1962,11 @@ function createStreamTextCleaner(options) {
           }
           if (dEnd === buf.length && !final) break;
           if (dEnd > matchedCardPrefix.length) {
+            var isImmersive = IMMERSIVE_CHIP_PREFIXES.indexOf(matchedCardPrefix) !== -1;
+            if (isImmersive) {
+              var chipIdx = parseInt(buf.slice(matchedCardPrefix.length, dEnd), 10);
+              if (seenChipIndices.indexOf(chipIdx) === -1) seenChipIndices.push(chipIdx);
+            }
             if (dEnd < buf.length && buf.charAt(dEnd) === '\r') {
               if (dEnd + 1 === buf.length && !final) break;
               if (dEnd + 1 < buf.length && buf.charAt(dEnd + 1) === '\n') dEnd += 2;
@@ -1764,6 +1974,11 @@ function createStreamTextCleaner(options) {
               dEnd += 1;
             }
             buf = buf.slice(dEnd);
+            if (isImmersive) {
+              pendingWs = '';
+              skipWs = true;
+              if (hasOutput) needBlockSep = true;
+            }
             continue;
           }
         }
@@ -1969,6 +2184,12 @@ function createStreamTextCleaner(options) {
     flush: function () {
       return process(true);
     },
+    getSeenChipIndices: function () {
+      return seenChipIndices.slice();
+    },
+    getTrailingNewlines: function () {
+      return trailingNewlines;
+    },
   };
 }
 
@@ -2066,12 +2287,17 @@ function isAnswerFrame(inner) {
  * @param {string} line - 单行响应文本
  * @returns {string|null} 最新的主候选答案文本，没有则返回 null
  */
-function bestMainAnswer(line) {
+function bestMainAnswerWithCanvas(line) {
   var best = '';
+  var canvasEntries = [];
   var frames = iterFrames(line);
   for (var i = 0; i < frames.length; i++) {
     var inner = frames[i];
     if (!isAnswerFrame(inner)) continue;
+    if (Array.isArray(inner[4]) && inner[4].length > 0) {
+      var entries = extractCanvasEntries(inner[4][0]);
+      if (entries.length > 0) canvasEntries = entries;
+    }
     var cands = candidateTexts(inner);
     for (var j = 0; j < cands.length; j++) {
       if (cands[j].index === 0 && cands[j].text.length > best.length) {
@@ -2079,7 +2305,11 @@ function bestMainAnswer(line) {
       }
     }
   }
-  return best || null;
+  return { text: best || null, canvasEntries: canvasEntries };
+}
+
+function bestMainAnswer(line) {
+  return bestMainAnswerWithCanvas(line).text;
 }
 
 /**
@@ -2102,13 +2332,15 @@ function extractResponseText(raw, config) {
   // 第一步：检查 BardErrorInfo 错误
   // 格式: BardErrorInfo [错误代码]
   // 例如: BardErrorInfo [10] 表示请求被拒绝
-  var bardErr = raw.match(/BardErrorInfo\s*\[(\d+)\]/);
+  var bardErr = raw.match(/BardErrorInfo"?,?\s*\[(\d+)\]/);
   if (bardErr) {
     throw new Error('Gemini upstream rejected request: BardErrorInfo [' + bardErr[1] + ']');
   }
 
   var mainBest = '';
   var anyBest = '';
+  var mainCanvas = {};
+  var anyCanvas = {};
   var lines = raw.split('\n');
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
@@ -2116,8 +2348,15 @@ function extractResponseText(raw, config) {
     for (var f = 0; f < frames.length; f++) {
       var inner = frames[f];
       var cands = candidateTexts(inner);
-      if (cands.length === 0) continue;
       var isMain = isAnswerFrame(inner);
+      if (Array.isArray(inner[4]) && inner[4].length > 0) {
+        var entries = extractCanvasEntries(inner[4][0]);
+        if (entries.length > 0) {
+          mergeCanvasEntries(anyCanvas, entries);
+          if (isMain) mergeCanvasEntries(mainCanvas, entries);
+        }
+      }
+      if (cands.length === 0) continue;
       for (var c = 0; c < cands.length; c++) {
         if (cands[c].text.length > anyBest.length) {
           anyBest = cands[c].text;
@@ -2129,11 +2368,28 @@ function extractResponseText(raw, config) {
     }
   }
 
+  var chosen = mainBest || anyBest;
+  var canvasMap = mainBest ? mainCanvas : anyCanvas;
+  var canvasKeys = Object.keys(canvasMap);
+  if (canvasKeys.length > 0) {
+    if (chosen.indexOf('immersive_entry_chip/') !== -1) {
+      chosen = inlineCanvasChips(chosen, canvasMap);
+    } else if (!chosen) {
+      var blocks = [];
+      canvasKeys.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+      for (var ck = 0; ck < canvasKeys.length; ck++) {
+        var blk = formatCanvasEntry(canvasMap[canvasKeys[ck]]);
+        if (blk) blocks.push(blk);
+      }
+      chosen = blocks.join('\n\n');
+    }
+  }
+
   // 清理代码执行痕迹和 Gemini 网页 UI 标签并返回
   var opts = config
     ? { cleanUiTags: config.cleanUiTags, elicitationMode: config.elicitationMode }
     : undefined;
-  return cleanGeminiText(mainBest || anyBest, true, opts);
+  return cleanGeminiText(chosen, true, opts);
 }
 
 // ============================================================================
@@ -2858,7 +3114,8 @@ async function handleChatCompletions(request, body, config) {
           }, 2000);
 
           // ---- 第三步：构建并发送 Gemini 请求 ----
-          var reqBody = buildPayload(prompt, modelId, thinkMode, config);
+          var effectivePrompt = preparePrompt(prompt, config);
+          var reqBody = buildPayload(effectivePrompt, modelId, thinkMode, config);
           var headers = await buildHeaders(config, modelName, modelId);
           var url = buildUrl(config);
 
@@ -2896,6 +3153,7 @@ async function handleChatCompletions(request, body, config) {
             var prevText = '';    // 记录之前已发送的完整文本
             var emittedAny = false;  // 是否已向客户端推送过内容
             var rawLines = [];       // 已完成的行（流结束时兜底重扫用）
+            var canvasMap = {};      // Canvas 产物缓存（按 chip 索引）
             var cleaner = createStreamTextCleaner({
               cleanUiTags: config.cleanUiTags,
               elicitationMode: config.elicitationMode,
@@ -2910,7 +3168,7 @@ async function handleChatCompletions(request, body, config) {
 
               // 检查 Gemini 错误信息
               if (buffer.indexOf('BardErrorInfo') !== -1) {
-                var match = buffer.match(/BardErrorInfo\s*\[(\d+)\]/);
+                var match = buffer.match(/BardErrorInfo"?,?\s*\[(\d+)\]/);
                 if (match) {
                   throw new Error('Gemini upstream rejected request: BardErrorInfo [' + match[1] + ']');
                 }
@@ -2929,7 +3187,11 @@ async function handleChatCompletions(request, body, config) {
                 // 只采用主答案框架（携带对话/响应 ID 的框架）的最新文本；
                 // 思考摘要、替代草稿、后续建议等框架一律忽略，从源头杜绝
                 // 把与问题无关的内容拼接进输出
-                var current = bestMainAnswer(line);
+                var mainRes = bestMainAnswerWithCanvas(line);
+                if (mainRes.canvasEntries.length > 0) {
+                  mergeCanvasEntries(canvasMap, mainRes.canvasEntries);
+                }
+                var current = mainRes.text;
                 if (!current) continue;
 
                 // 重复或较旧的更新（流式过程中同一框架会随答案增长被重发）
@@ -2990,6 +3252,42 @@ async function handleChatCompletions(request, body, config) {
                   finish_reason: null
                 }],
               }) + '\n\n'));
+            }
+
+            // 如果上游仍触发了 Canvas（cand[30]），在流结束时补发提取出的完整代码块
+            var canvasKeyList = Object.keys(canvasMap);
+            if (canvasKeyList.length > 0) {
+              var seenChips = cleaner.getSeenChipIndices();
+              var order = [];
+              for (var si = 0; si < seenChips.length; si++) {
+                if (canvasMap[seenChips[si]]) order.push(seenChips[si]);
+              }
+              canvasKeyList.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+              for (var ki = 0; ki < canvasKeyList.length; ki++) {
+                var idxNum = parseInt(canvasKeyList[ki], 10);
+                if (order.indexOf(idxNum) === -1) order.push(idxNum);
+              }
+              var canvasBlocks = [];
+              for (var oi = 0; oi < order.length; oi++) {
+                var blkText = formatCanvasEntry(canvasMap[order[oi]]);
+                if (blkText) canvasBlocks.push(blkText);
+              }
+              if (canvasBlocks.length > 0) {
+                var needNl = emittedAny ? Math.max(0, 2 - cleaner.getTrailingNewlines()) : 0;
+                var sep = needNl === 2 ? '\n\n' : (needNl === 1 ? '\n' : '');
+                emittedAny = true;
+                controller.enqueue(streamEncoder.encode('data: ' + JSON.stringify({
+                  id: chatId,
+                  object: 'chat.completion.chunk',
+                  created: timestamp(),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta: { content: sep + canvasBlocks.join('\n\n') },
+                    finish_reason: null
+                  }],
+                }) + '\n\n'));
+              }
             }
 
             // ---- 第四步半：流结束兜底 ----

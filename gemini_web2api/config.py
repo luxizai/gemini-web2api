@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "model_tickets": {},
     "clean_ui_tags": True,
     "elicitation_mode": "strip",
+    "disable_canvas": True,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

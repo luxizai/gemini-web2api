@@ -22,6 +22,7 @@ from gemini_web2api.gemini import (
     clean_text,
     extract_response_text,
     generate_stream,
+    _prepare_prompt,
     _next_reqid,
     _build_headers,
 )
@@ -49,12 +50,16 @@ def make_raw(*lines):
     return ")]}'\n\n" + body
 
 
-def answer_inner(segments, drafts=(), convo="c_abc123", resp="r_def456"):
+def answer_inner(segments, drafts=(), convo="c_abc123", resp="r_def456", canvas_entries=None):
     """Main answer frame: carries conversation id at [1] and response id at [2]."""
     inner = [None] * 6
     inner[1] = convo
     inner[2] = resp
-    candidates = [[None, list(segments)]]
+    primary = [None, list(segments)]
+    if canvas_entries is not None:
+        primary.extend([None] * (31 - len(primary)))
+        primary[30] = canvas_entries
+    candidates = [primary]
     for draft in drafts:
         candidates.append([None, list(draft)])
     inner[4] = candidates
@@ -326,6 +331,85 @@ class UiTagCleaningTests(unittest.TestCase):
         self.assertEqual(out, "正文结束。")
 
 
+# ─── Canvas / immersive_entry_chip handling ─────────────────────────────────
+
+def _make_canvas_entry(doc_id, title, content, kind=2, lang="html"):
+    entry = [None] * 15
+    entry[0] = doc_id
+    entry[1] = title
+    entry[2] = content
+    entry[10] = kind
+    entry[14] = [None, lang, None, None, None] if kind == 2 else [None, None, None, None, lang]
+    return entry
+
+
+class CanvasHandlingTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_prepare_prompt_injects_no_canvas_hint_by_default(self):
+        CONFIG["disable_canvas"] = True
+        prepared = _prepare_prompt("生成一个 H5 SVG 动画")
+        self.assertIn("Do not use Canvas", prepared)
+        self.assertTrue(prepared.endswith("生成一个 H5 SVG 动画"))
+        # Idempotent if prompt already has canvas guidance
+        self.assertEqual(_prepare_prompt(prepared), prepared)
+        # Respects opt-out
+        CONFIG["disable_canvas"] = False
+        self.assertEqual(_prepare_prompt("生成一个 H5 SVG 动画"), "生成一个 H5 SVG 动画")
+
+    def test_extract_response_text_inlines_canvas_html_code(self):
+        html_code = "<!DOCTYPE html>\n<html>\n<body><svg><circle r=\"10\"/></svg></body>\n</html>"
+        canvas = [_make_canvas_entry("c_abc_pelican.html", "鹈鹕骑自行车", html_code, kind=2, lang="html")]
+        text = (
+            "我将为你创建单文件 H5 页面。\n\n"
+            "http://googleusercontent.com/immersive_entry_chip/0\n\n"
+            "你可以直接打开预览。"
+        )
+        raw = make_raw(make_line(answer_inner([text], canvas_entries=canvas)))
+        out = extract_response_text(raw)
+        self.assertNotIn("immersive_entry_chip", out)
+        self.assertIn("**鹈鹕骑自行车**\n\n```html\n" + html_code + "\n```", out)
+        self.assertTrue(out.startswith("我将为你创建单文件 H5 页面。\n\n**鹈鹕骑自行车**"))
+        self.assertTrue(out.endswith("```\n\n你可以直接打开预览。"))
+
+        # Single-file parity
+        single = load_single_file()
+        self.assertEqual(single.extract_response_text(raw), out)
+
+    def test_extract_response_text_formats_markdown_canvas_document(self):
+        doc_body = "第一段内容，详细介绍架构设计与关键取舍。\n\n第二段内容继续展开。"
+        canvas = [_make_canvas_entry("c_abc_doc", "架构说明文档", doc_body, kind=1, lang="zh")]
+        text = "已生成文档：\n\nhttp://googleusercontent.com/immersive_entry_chip/0"
+        raw = make_raw(make_line(answer_inner([text], canvas_entries=canvas)))
+        out = extract_response_text(raw)
+        self.assertEqual(out, f"已生成文档：\n\n### 架构说明文档\n\n{doc_body}")
+
+    def test_extract_response_text_handles_backticks_inside_canvas_code(self):
+        code = "const s = ```nested```;\nconsole.log(s);"
+        canvas = [_make_canvas_entry("c_abc_app.js", "app.js", code, kind=2, lang="javascript")]
+        raw = make_raw(make_line(answer_inner(["http://googleusercontent.com/immersive_entry_chip/0"], canvas_entries=canvas)))
+        out = extract_response_text(raw)
+        self.assertIn("````javascript\n" + code + "\n````", out)
+
+    def test_unresolvable_immersive_chip_is_stripped(self):
+        text = "说明文字。\n\nhttp://googleusercontent.com/immersive_entry_chip/0\n\n后续说明。"
+        raw = make_raw(make_line(answer_inner([text])))
+        out = extract_response_text(raw)
+        self.assertNotIn("immersive_entry_chip", out)
+        self.assertEqual(out, "说明文字。\n\n后续说明。")
+
+    def test_bard_error_1003_mentions_cookie_requirement(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            extract_response_text(')]}\'\n\n[3,["er",null,"BardErrorInfo [1003]"]]\n')
+        self.assertIn("[1003]", str(ctx.exception))
+        self.assertIn("cookie", str(ctx.exception).lower())
+
+
 
 # ─── request ids ─────────────────────────────────────────────────────────────
 
@@ -436,6 +520,26 @@ class GenerateStreamTests(unittest.TestCase):
         chunks = [")]}\'\n\n"] + [make_line(answer_inner([s])) + "\n" for s in snapshots]
         out = self._run(FakeHttpClient([chunks]))
         self.assertEqual(out, "步骤如下：\n\n#### 1. 第一步 — 终端\n\n运行 `git pull`。")
+
+    def test_stream_extracts_canvas_and_strips_immersive_chip(self):
+        partial_html = "<!DOCTYPE html>\n<html><body>partial"
+        final_html = "<!DOCTYPE html>\n<html><body><svg>pelican</svg></body></html>"
+        chunks = [
+            ")]}\'\n\n",
+            make_line(answer_inner(["正在创建页面。\n\nhttp://googleusercontent.com/immersive_"])) + "\n",
+            make_line(answer_inner(
+                ["正在创建页面。\n\nhttp://googleusercontent.com/immersive_entry_chip/0"],
+                canvas_entries=[_make_canvas_entry("c_1_a.html", "pelican.html", partial_html, kind=2, lang="html")],
+            )) + "\n",
+            make_line(answer_inner(
+                ["正在创建页面。\n\nhttp://googleusercontent.com/immersive_entry_chip/0\n\n完成！"],
+                canvas_entries=[_make_canvas_entry("c_1_a.html", "pelican.html", final_html, kind=2, lang="html")],
+            )) + "\n",
+        ]
+        out = self._run(FakeHttpClient([chunks]))
+        self.assertNotIn("immersive_entry_chip", out)
+        self.assertIn("正在创建页面。\n\n完成！", out)
+        self.assertIn("**pelican.html**\n\n```html\n" + final_html + "\n```", out)
 
 
 if __name__ == "__main__":

@@ -192,7 +192,8 @@ Create `config.json` in the same directory:
   "temporary_chats": false,
   "model_tickets": {},
   "clean_ui_tags": true,
-  "elicitation_mode": "strip"
+  "elicitation_mode": "strip",
+  "disable_canvas": true
 }
 ```
 
@@ -202,6 +203,7 @@ persisting conversations to the account history.
 - `model_tickets`: Optional map of `model_name -> 16-hex ticket` overrides for the `x-goog-ext-525001261-jspb` routing header (useful if Google rotates a model's ticket ID on `gemini.google.com`).
 - `clean_ui_tags`: When `true` (default), converts Gemini Web `<Steps>`/`<Step>` tags into clean Markdown headings and filters `<ElicitationsGroup>`/`<FollowUp>` widgets without affecting code blocks.
 - `elicitation_mode`: `"strip"` (default) removes follow-up chip tags; `"markdown"` converts them into a trailing Markdown bullet list.
+- `disable_canvas`: When `true` (default), instructs Gemini to output code/HTML/SVG directly in standard Markdown code blocks rather than Canvas (`immersive_entry_chip/0`). If Canvas still triggers, the parser also extracts code/document artifacts from `candidate[30]` and replaces the placeholder link automatically.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
